@@ -109,6 +109,23 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 110, 96, 60, 14
 END
 
+// JPEG / WebP save options (shown after Save As picks a lossy format)
+IDD_SAVE_OPTIONS DIALOGEX 0, 0, 236, 112
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Save Options"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Quality:", IDC_STATIC, 7, 11, 34, 9
+    CONTROL         "", IDC_SAVEOPT_SLIDER, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 40, 7, 152, 16
+    EDITTEXT        IDC_SAVEOPT_QUALITY, 196, 8, 32, 14, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Higher quality gives a larger file. 90 suits most images.", IDC_SAVEOPT_HINT, 7, 30, 222, 9
+    AUTOCHECKBOX    "Lossless (exact colours, larger file)", IDC_SAVEOPT_LOSSLESS, 7, 29, 222, 10
+    LTEXT           "Estimated size:", IDC_SAVEOPT_SIZE, 7, 47, 222, 9
+    AUTOCHECKBOX    "Don't ask again (hold Shift when choosing Save As to see this)", IDC_SAVEOPT_DONTASK, 7, 66, 222, 10
+    DEFPUSHBUTTON   "Save", IDOK, 122, 91, 52, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 177, 91, 52, 14
+END
+
 // Help / About dialog
 IDD_ABOUT DIALOGEX 0, 0, 340, 295
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX

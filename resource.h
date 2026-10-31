@@ -134,6 +134,7 @@
 #define IDD_TEXT_INPUT          201
 #define IDD_ABOUT               202
 #define IDD_RESIZE_CANVAS       203
+#define IDD_SAVE_OPTIONS        204
 
 // Standard control IDs
 #define IDC_STATIC              -1
@@ -150,6 +151,14 @@
 #define IDC_RESIZE_H_PCT        1013
 #define IDC_RESIZE_LOCK_ASPECT  1014
 #define IDC_RESIZE_CANVAS_ONLY  1015
+
+// Dialog control IDs — JPEG / WebP save options
+#define IDC_SAVEOPT_SLIDER      1030
+#define IDC_SAVEOPT_QUALITY     1031
+#define IDC_SAVEOPT_LOSSLESS    1032
+#define IDC_SAVEOPT_SIZE        1033
+#define IDC_SAVEOPT_DONTASK     1034
+#define IDC_SAVEOPT_HINT        1035
 
 // Dialog control IDs — Help/About
 #define IDC_HELP_TEXT           1020

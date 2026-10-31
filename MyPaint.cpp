@@ -458,6 +458,12 @@ static int   g_bgAlpha            = 100;  // 0-100 percentage
 static bool  g_darkMode           = false;
 static bool  g_restoreFolderBrowser = false;   // folder browser was open at last exit
 
+// Save settings for lossy formats, set in the Save As options dialog
+static int  g_jpegQuality    = 90;     // 1..100
+static int  g_webpQuality    = 90;     // 1..100, ignored when lossless
+static bool g_webpLossless   = false;
+static bool g_askSaveOptions = true;   // show the dialog on Save As to JPEG/WebP
+
 // Recently opened or saved images, newest first; shown in File > Open Recent
 static const int MAX_RECENT_FILES = 10;
 static std::vector<std::wstring> g_recentFiles;
@@ -1159,7 +1165,8 @@ static Bitmap* LoadWebP(const wchar_t* file, HRESULT* pHrOut = nullptr, const wc
     return MakeBitmapFromPixels(img);
 }
 
-static bool SaveWebPBitmap(Bitmap* bmp, const wchar_t* file)
+// Encodes a bitmap as WebP into out. quality 1..100 (ignored when lossless).
+static bool EncodeWebP(Bitmap* bmp, int quality, bool lossless, std::vector<uint8_t>& out)
 {
     int w = (int)bmp->GetWidth(), h = (int)bmp->GetHeight();
 
@@ -1171,18 +1178,60 @@ static bool SaveWebPBitmap(Bitmap* bmp, const wchar_t* file)
     // Encode — GDI+ PixelFormat32bppARGB byte order is BGRA, matching WebPEncodeBGRA
     uint8_t* output = nullptr;
     const int stride = std::abs(bd.Stride);
-    size_t outputSize = WebPEncodeBGRA((const uint8_t*)bd.Scan0, w, h, stride, 90.0f, &output);
+    size_t outputSize = lossless
+        ? WebPEncodeLosslessBGRA((const uint8_t*)bd.Scan0, w, h, stride, &output)
+        : WebPEncodeBGRA((const uint8_t*)bd.Scan0, w, h, stride, (float)quality, &output);
     bmp->UnlockBits(&bd);
 
     if (!outputSize || !output) return false;
+    out.assign(output, output + outputSize);
+    WebPFree(output);
+    return true;
+}
 
+// Saves as WebP with the current save settings
+static bool SaveWebPBitmap(Bitmap* bmp, const wchar_t* file)
+{
+    std::vector<uint8_t> data;
+    if (!EncodeWebP(bmp, g_webpQuality, g_webpLossless, data)) return false;
     FILE* f = nullptr;
     bool ok = _wfopen_s(&f, file, L"wb") == 0 && f;
     if (ok) {
-        ok = (fwrite(output, 1, outputSize, f) == outputSize);
+        ok = (fwrite(data.data(), 1, data.size(), f) == data.size());
         fclose(f);
     }
-    WebPFree(output);
+    return ok;
+}
+
+// JPEG has no transparency: flatten onto white first (GDI+ would turn
+// transparent pixels black). Caller deletes the result.
+static Bitmap* FlattenForJpeg(Bitmap* bmp)
+{
+    int w = (int)bmp->GetWidth(), h = (int)bmp->GetHeight();
+    Bitmap* flat = new Bitmap(w, h, PixelFormat24bppRGB);
+    if (flat->GetLastStatus() != Ok) { delete flat; return nullptr; }
+    Graphics g(flat);
+    g.Clear(Color(255, 255, 255, 255));
+    g.DrawImage(bmp, 0, 0, w, h);
+    return flat;
+}
+
+// Saves a bitmap as JPEG at quality 1..100, to a file or (if file is null) a stream
+static bool SaveJpeg(Bitmap* bmp, int quality, const wchar_t* file, IStream* stream = nullptr)
+{
+    CLSID enc;
+    if (!GetEncoderClsid(L"image/jpeg", &enc)) return false;
+    Bitmap* flat = FlattenForJpeg(bmp);
+    if (!flat) return false;
+    ULONG q = (ULONG)max(1, min(100, quality));
+    EncoderParameters ep;
+    ep.Count = 1;
+    ep.Parameter[0].Guid           = EncoderQuality;
+    ep.Parameter[0].NumberOfValues = 1;
+    ep.Parameter[0].Type           = EncoderParameterValueTypeLong;
+    ep.Parameter[0].Value          = &q;
+    bool ok = (file ? flat->Save(file, &enc, &ep) : flat->Save(stream, &enc, &ep)) == Ok;
+    delete flat;
     return ok;
 }
 
@@ -1643,14 +1692,20 @@ static void SaveToFile(const wchar_t* filepath)
     const wchar_t* dot = wcsrchr(filepath, L'.');
     bool isWebP = dot && _wcsicmp(dot + 1, L"webp") == 0;
 
+    bool isJpeg = dot && (_wcsicmp(dot + 1, L"jpg") == 0 || _wcsicmp(dot + 1, L"jpeg") == 0);
+    // Large images can take seconds (lossless WebP above all)
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
     bool ok;
     if (isWebP) {
         ok = SaveWebP(filepath);
+    } else if (isJpeg) {
+        ok = SaveJpeg(g_pCanvas, g_jpegQuality, filepath);
     } else {
         CLSID enc;
         if (!GetSaveEncoder(filepath, enc)) GetEncoderClsid(L"image/png", &enc);
         ok = (g_pCanvas->Save(filepath, &enc) == Ok);
     }
+    SetCursor(oldCursor);
 
     if (!ok) {
         MessageBox(g_hwndMain, L"Failed to save file.", APP_TITLE, MB_ICONERROR);
@@ -1682,8 +1737,182 @@ static void DoSave()
     SaveToFile(g_currentFile);
 }
 
+// ─── JPEG / WebP save options dialog ────────────────────────────────────────
+// Shown after Save As picks a lossy format (never on plain Save). Settings are
+// remembered; "Don't ask again" skips it, and Shift+Save As brings it back.
+
+struct SaveOptionsData {
+    bool    webp;
+    int     quality;
+    bool    lossless;
+    bool    dontAsk;
+    Bitmap* sample;       // canvas, scaled down when big, for the size estimate
+    double  sampleScale;  // canvas pixels per sample pixel
+};
+static SaveOptionsData g_saveOpt;
+static const UINT_PTR SAVEOPT_ESTIMATE_TIMER = 1;
+
+static void SaveOptionsEstimate(HWND hDlg)
+{
+    SaveOptionsData& d = g_saveOpt;
+    if (!d.sample) return;
+    unsigned long long bytes = 0;
+    if (d.webp) {
+        std::vector<uint8_t> data;
+        if (EncodeWebP(d.sample, d.quality, d.lossless, data)) bytes = data.size();
+    } else {
+        IStream* st = nullptr;
+        if (SUCCEEDED(CreateStreamOnHGlobal(NULL, TRUE, &st)) && st) {
+            if (SaveJpeg(d.sample, d.quality, nullptr, st)) {
+                STATSTG ss = {};
+                if (SUCCEEDED(st->Stat(&ss, STATFLAG_NONAME))) bytes = ss.cbSize.QuadPart;
+            }
+            st->Release();
+        }
+    }
+    bytes = (unsigned long long)(bytes * d.sampleScale);
+    wchar_t text[96];
+    const wchar_t* about = d.sampleScale > 1.0 ? L"about " : L"";
+    if (!bytes)                    StringCchCopy(text, ARRAYSIZE(text), L"Estimated size: unknown");
+    else if (bytes < 1024 * 1024)  StringCchPrintf(text, ARRAYSIZE(text), L"Estimated size: %s%llu KB", about, (bytes + 512) / 1024);
+    else                           StringCchPrintf(text, ARRAYSIZE(text), L"Estimated size: %s%.1f MB", about, bytes / (1024.0 * 1024.0));
+    SetDlgItemTextW(hDlg, IDC_SAVEOPT_SIZE, text);
+}
+
+static INT_PTR CALLBACK SaveOptionsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    static bool s_syncing = false;
+    SaveOptionsData& d = g_saveOpt;
+    auto scheduleEstimate = [&]() {
+        SetDlgItemTextW(hDlg, IDC_SAVEOPT_SIZE, L"Estimated size: …");
+        SetTimer(hDlg, SAVEOPT_ESTIMATE_TIMER, 250, NULL);   // after the slider settles
+    };
+    auto updateEnable = [&]() {
+        BOOL q = !(d.webp && d.lossless);
+        EnableWindow(GetDlgItem(hDlg, IDC_SAVEOPT_SLIDER), q);
+        EnableWindow(GetDlgItem(hDlg, IDC_SAVEOPT_QUALITY), q);
+    };
+    switch (msg) {
+    case WM_INITDIALOG: {
+        SetWindowTextW(hDlg, d.webp ? L"WebP Options" : L"JPEG Options");
+        HWND sl = GetDlgItem(hDlg, IDC_SAVEOPT_SLIDER);
+        SendMessage(sl, TBM_SETRANGE, TRUE, MAKELPARAM(1, 100));
+        SendMessage(sl, TBM_SETPAGESIZE, 0, 10);
+        SendMessage(sl, TBM_SETPOS, TRUE, d.quality);
+        s_syncing = true;
+        SetDlgItemInt(hDlg, IDC_SAVEOPT_QUALITY, d.quality, FALSE);
+        s_syncing = false;
+        SendDlgItemMessage(hDlg, IDC_SAVEOPT_QUALITY, EM_LIMITTEXT, 3, 0);
+        // JPEG shows a hint where WebP shows its Lossless checkbox
+        ShowWindow(GetDlgItem(hDlg, IDC_SAVEOPT_LOSSLESS), d.webp ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(hDlg, IDC_SAVEOPT_HINT),     d.webp ? SW_HIDE : SW_SHOW);
+        CheckDlgButton(hDlg, IDC_SAVEOPT_LOSSLESS, d.lossless ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_SAVEOPT_DONTASK,  d.dontAsk  ? BST_CHECKED : BST_UNCHECKED);
+        if (g_darkMode) {
+            // Unthemed checkboxes so WM_CTLCOLORSTATIC can colour their text
+            SetWindowTheme(GetDlgItem(hDlg, IDC_SAVEOPT_LOSSLESS), L"", L"");
+            SetWindowTheme(GetDlgItem(hDlg, IDC_SAVEOPT_DONTASK),  L"", L"");
+            SetWindowTheme(GetDlgItem(hDlg, IDOK),     L"DarkMode_Explorer", NULL);
+            SetWindowTheme(GetDlgItem(hDlg, IDCANCEL), L"DarkMode_Explorer", NULL);
+            BOOL dark = TRUE;
+            DwmSetWindowAttribute(hDlg, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+        }
+        updateEnable();
+        scheduleEstimate();
+        return TRUE;
+    }
+    case WM_HSCROLL:
+        if ((HWND)lParam == GetDlgItem(hDlg, IDC_SAVEOPT_SLIDER)) {
+            d.quality = (int)SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
+            s_syncing = true;
+            SetDlgItemInt(hDlg, IDC_SAVEOPT_QUALITY, d.quality, FALSE);
+            s_syncing = false;
+            scheduleEstimate();
+        }
+        return TRUE;
+    case WM_TIMER:
+        if (wParam == SAVEOPT_ESTIMATE_TIMER) {
+            KillTimer(hDlg, SAVEOPT_ESTIMATE_TIMER);
+            HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+            SaveOptionsEstimate(hDlg);
+            SetCursor(old);
+        }
+        return TRUE;
+    case WM_COMMAND: {
+        WORD id = LOWORD(wParam), code = HIWORD(wParam);
+        if (id == IDC_SAVEOPT_QUALITY && code == EN_CHANGE && !s_syncing) {
+            BOOL ok = FALSE;
+            int q = (int)GetDlgItemInt(hDlg, IDC_SAVEOPT_QUALITY, &ok, FALSE);
+            if (ok && q >= 1 && q <= 100) {
+                d.quality = q;
+                SendDlgItemMessage(hDlg, IDC_SAVEOPT_SLIDER, TBM_SETPOS, TRUE, q);
+                scheduleEstimate();
+            }
+            return TRUE;
+        }
+        if (id == IDC_SAVEOPT_LOSSLESS && code == BN_CLICKED) {
+            d.lossless = IsDlgButtonChecked(hDlg, IDC_SAVEOPT_LOSSLESS) == BST_CHECKED;
+            updateEnable();
+            scheduleEstimate();
+            return TRUE;
+        }
+        if (id == IDOK || id == IDCANCEL) {
+            KillTimer(hDlg, SAVEOPT_ESTIMATE_TIMER);
+            d.dontAsk = IsDlgButtonChecked(hDlg, IDC_SAVEOPT_DONTASK) == BST_CHECKED;
+            EndDialog(hDlg, id);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORDLG:
+        if (g_darkMode && g_hDarkBgBrush) {
+            SetTextColor((HDC)wParam, RGB(220, 220, 220));
+            SetBkColor((HDC)wParam, RGB(45, 45, 48));
+            return (INT_PTR)g_hDarkBgBrush;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+// Asks for JPEG / WebP settings for a Save As. False if the user cancelled.
+static bool AskSaveOptions(bool webp)
+{
+    SaveOptionsData& d = g_saveOpt;
+    d.webp     = webp;
+    d.quality  = webp ? g_webpQuality : g_jpegQuality;
+    d.lossless = g_webpLossless;
+    d.dontAsk  = !g_askSaveOptions;
+    // Estimate from a copy of at most ~4 megapixels so the dialog stays quick
+    int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
+    double px = (double)w * h, maxPx = 4.0 * 1024 * 1024;
+    double f = px > maxPx ? sqrt(maxPx / px) : 1.0;
+    int sw = max(1, (int)(w * f)), sh = max(1, (int)(h * f));
+    d.sample = new Bitmap(sw, sh, PixelFormat32bppARGB);
+    {
+        Graphics g(d.sample);
+        g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+        g.DrawImage(g_pCanvas, 0, 0, sw, sh);
+    }
+    d.sampleScale = px / ((double)sw * sh);
+    if (!g_hDarkBgBrush && g_darkMode) g_hDarkBgBrush = CreateSolidBrush(RGB(45, 45, 48));
+    INT_PTR r = DialogBox(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_SAVE_OPTIONS), g_hwndMain, SaveOptionsDlgProc);
+    delete d.sample; d.sample = nullptr;
+    if (r != IDOK) return false;
+    if (webp) { g_webpQuality = d.quality; g_webpLossless = d.lossless; }
+    else        g_jpegQuality = d.quality;
+    g_askSaveOptions = !d.dontAsk;
+    return true;
+}
+
 static void DoSaveAs()
 {
+    // Shift held when choosing Save As shows the JPEG/WebP options even after
+    // "Don't ask again"
+    bool forceOptions = GetKeyState(VK_SHIFT) < 0;
     wchar_t file[MAX_PATH] = {};
     if (g_currentFile[0] != L'\0') StringCchCopy(file, MAX_PATH, g_currentFile);
     // Suggest a PNG beside an SVG (or other unwritable file) rather than its own name
@@ -1719,6 +1948,11 @@ static void DoSaveAs()
     ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     ofn.lpstrTitle   = L"Save Image As";
     if (!GetSaveFileName(&ofn)) return;
+    const wchar_t* dot = wcsrchr(file, L'.');
+    bool jpeg = dot && (_wcsicmp(dot + 1, L"jpg") == 0 || _wcsicmp(dot + 1, L"jpeg") == 0);
+    bool webp = dot && _wcsicmp(dot + 1, L"webp") == 0;
+    if ((jpeg || webp) && (g_askSaveOptions || forceOptions) && g_pCanvas && !AskSaveOptions(webp))
+        return;
     SaveToFile(file);
 }
 
@@ -1823,6 +2057,11 @@ static void LoadSettings()
     if (qv(L"FolderBrowserH", &val) && val <= 4000)
         g_folderBrowserH = max(FOLDER_BROWSER_MIN_H, (int)val);
 
+    if (qv(L"JpegQuality", &val) && val >= 1 && val <= 100) g_jpegQuality = (int)val;
+    if (qv(L"WebpQuality", &val) && val >= 1 && val <= 100) g_webpQuality = (int)val;
+    if (qv(L"WebpLossless", &val))   g_webpLossless   = (val != 0);
+    if (qv(L"AskSaveOptions", &val)) g_askSaveOptions = (val != 0);
+
     g_recentFiles.clear();
     for (int i = 0; i < MAX_RECENT_FILES; i++) {
         wchar_t name[32], path[MAX_PATH];
@@ -1896,6 +2135,10 @@ static void SaveSettings()
     sv(L"DarkMode", (DWORD)(g_darkMode ? 1 : 0));
     sv(L"FolderBrowser", (DWORD)(g_showFolderBrowser ? 1 : 0));
     sv(L"FolderBrowserH", (DWORD)g_folderBrowserH);
+    sv(L"JpegQuality",    (DWORD)g_jpegQuality);
+    sv(L"WebpQuality",    (DWORD)g_webpQuality);
+    sv(L"WebpLossless",   (DWORD)(g_webpLossless ? 1 : 0));
+    sv(L"AskSaveOptions", (DWORD)(g_askSaveOptions ? 1 : 0));
 
     for (int i = 0; i < MAX_RECENT_FILES; i++) {
         wchar_t name[32];
@@ -3727,11 +3970,39 @@ static void OpenInInkscape(const std::wstring& path)
         MessageBox(g_hwndMain, L"Could not start Inkscape.", APP_TITLE, MB_ICONERROR);
 }
 
+// History icon (_dev/history.svg): a clock whose rim runs back to an arrow.
+// A stroke path, drawn with a 1.5-unit pen in a 24-unit box.
+static const char* kHistoryD =
+    "M 4,12 A 8,8 0 1 1 6.34,17.66 M 1.5,9.5 L 4,12 L 6.5,9.5 M 12,7.5 V 12 L 15,14";
+
+static HBITMAP MakeHistoryMenuIcon(int sz)
+{
+    COLORREF crBg   = g_darkMode ? RGB(43, 43, 43)    : GetSysColor(COLOR_MENU);
+    COLORREF crIcon = g_darkMode ? RGB(200, 200, 200) : RGB(45, 45, 45);
+    Bitmap bmp(sz, sz, PixelFormat32bppRGB);
+    {
+        Graphics g(&bmp);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.Clear(Color(255, GetRValue(crBg), GetGValue(crBg), GetBValue(crBg)));
+        float sc = sz / 24.0f;
+        GraphicsPath path;
+        AddSvgPath(path, kHistoryD, sc);
+        Pen pen(Color(255, GetRValue(crIcon), GetGValue(crIcon), GetBValue(crIcon)), 1.5f * sc);
+        pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound); pen.SetLineJoin(LineJoinRound);
+        g.DrawPath(&pen, &path);
+    }
+    HBITMAP hbm = NULL;
+    bmp.GetHBITMAP(Color(255, GetRValue(crBg), GetGValue(crBg), GetBValue(crBg)), &hbm);
+    return hbm;
+}
+
 // Rebuilds the File > Open Recent submenu (placed just after Open) from
 // g_recentFiles. Called as the File menu opens.
 static void UpdateFileMenuRecent(HMENU hFile)
 {
-    static HMENU s_recent = NULL;
+    static HMENU   s_recent = NULL;
+    static HBITMAP s_icon   = NULL;
     if (s_recent) {
         for (int pos = 0, n = GetMenuItemCount(hFile); pos < n; pos++)
             if (GetSubMenu(hFile, pos) == s_recent) { RemoveMenu(hFile, pos, MF_BYPOSITION); break; }
@@ -3753,6 +4024,13 @@ static void UpdateFileMenuRecent(HMENU hFile)
     int pos = 0;
     for (int n = GetMenuItemCount(hFile); pos < n && GetMenuItemID(hFile, pos) != ID_FILE_OPEN; pos++) {}
     InsertMenuW(hFile, pos + 1, MF_BYPOSITION | MF_POPUP | MF_STRING, (UINT_PTR)s_recent, L"Open &Recent");
+    // Rebuilt each time so it follows dark mode
+    if (s_icon) DeleteObject(s_icon);
+    s_icon = MakeHistoryMenuIcon(16);
+    MENUITEMINFOW mii = { sizeof(mii) };
+    mii.fMask    = MIIM_BITMAP;
+    mii.hbmpItem = s_icon;
+    SetMenuItemInfoW(hFile, pos + 1, TRUE, &mii);
 }
 
 static void OpenRecentFile(int i)
@@ -6504,6 +6782,14 @@ L"File > Delete       Send the open image to the Recycle Bin and\r\n"
 L"                    open the next image in its folder\r\n"
 L"File > Open in Inkscape\r\n"
 L"                    Shown for SVG files when Inkscape is installed\r\n"
+L"JPEG / WebP quality Save As to a .jpg or .webp shows a small options\r\n"
+L"                    dialog: quality slider, estimated file size, and\r\n"
+L"                    for WebP a Lossless option. Settings are\r\n"
+L"                    remembered; plain Save (Ctrl+S) never asks.\r\n"
+L"                    \"Don't ask again\" skips it; hold Shift when\r\n"
+L"                    choosing Save As to see it again.\r\n"
+L"                    Defaults: quality 90. JPEG has no transparency,\r\n"
+L"                    so transparent areas are saved as white.\r\n"
 L"Saving an SVG       MyPaint saves PNG, JPEG, BMP, GIF, TIFF and WebP.\r\n"
 L"                    Save on an SVG opens Save As with a .png name, so\r\n"
 L"                    the original SVG is never overwritten.\r\n"
