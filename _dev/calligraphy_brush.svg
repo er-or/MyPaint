@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   class="svg-icon"
+   style="overflow:hidden;fill:currentColor"
+   viewBox="0 0 1048576 1048576"
+   version="1.1"
+   id="svg4"
+   width="1048576"
+   height="1048576"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs4" />
+  <g
+     id="layer1">
+    <path
+       style="fill:none;stroke:#00f900;stroke-width:55;stroke-linejoin:round;stroke-dasharray:none;stroke-opacity:1"
+       d="M 348.596,604.309 830.20829,64.215005 c 31.51663,-35.343667 93.81847,-23.060479 124.98992,4.586787 27.60598,24.484898 46.87249,89.358608 11.46696,120.403138 L 417.398,670.817 c -10.62816,-25.74673 -35.2774,-51.83393 -68.802,-66.508 z"
+       id="path5" />
+    <path
+       style="fill:none;stroke:#00f900;stroke-width:55;stroke-linejoin:round;stroke-dasharray:none;stroke-opacity:1"
+       d="m 220.54763,617.85771 c 38.07589,-31.9548 87.03891,-34.00561 128.04837,-13.54871 30.25341,15.09142 59.75112,36.58885 68.802,66.508 20.36842,67.33112 7.57313,131.35468 -33.46673,177.7238 C 295.14639,948.8549 162.40004,968.67841 29.190128,987.59933 101.16928,958.49339 169.37111,894.6818 171.08658,777.59258 c 0.9762,-66.62991 7.90095,-124.85598 49.46105,-159.73487 z"
+       id="path6" />
+  </g>
+</svg>

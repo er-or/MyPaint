@@ -1,0 +1,13 @@
+# Visual Studio state and build output
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.aps
+
+# libwebp: keep the headers and .lib files the build needs, not the
+# downloaded archive, command-line tools or sample files
+third_party/*.zip
+third_party/libwebp-*/bin/
+third_party/libwebp-*/test*
