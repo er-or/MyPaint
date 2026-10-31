@@ -11,3 +11,9 @@ Release/
 third_party/*.zip
 third_party/libwebp-*/bin/
 third_party/libwebp-*/test*
+
+# Old app icon artwork copied from Microsoft Paint: kept locally for
+# reference, not redistributable. The icon is built from _dev/mypaint_icon.svg.
+_dev/free_paint_icon*
+_dev/new_icon_256_preview.png
+_dev/MyPaint_original.ico

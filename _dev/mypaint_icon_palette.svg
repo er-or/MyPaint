@@ -1,0 +1,35 @@
+<svg x="0" y="0" viewBox="0 0 150 150" version="1.1" xmlns="http://www.w3.org/2000/svg">
+<!-- MyPaint app icon: palette and brush in "sticker" style (orange disc, white border, thin dark outline).
+     make_icon.ps1 renders this file to MyPaint.ico. Keep to <circle> and <path> elements with
+     fill / stroke / stroke-width / fill-rule attributes: that is all the script reads. -->
+
+<!-- Background disc -->
+<circle cx="75" cy="75" r="75" fill="#ff8800" />
+
+<!-- Palette: white sticker border, then fill and outline. The second subpath is the thumb hole. -->
+<path fill="none" stroke="#ffffff" stroke-width="10" fill-rule="evenodd"
+      d="M 26,72 C 26,44 52,30 80,31 C 110,32 128,49 126,73 C 124,93 107,100 94,97 C 84,95 79,101 83,109 C 88,119 79,129 62,127 C 39,124 26,102 26,72 Z M 53,97 A 10,10 0 1 0 53,117 A 10,10 0 1 0 53,97 Z" />
+<path fill="#f5d7a1" stroke="#222222" stroke-width="1.5" fill-rule="evenodd"
+      d="M 26,72 C 26,44 52,30 80,31 C 110,32 128,49 126,73 C 124,93 107,100 94,97 C 84,95 79,101 83,109 C 88,119 79,129 62,127 C 39,124 26,102 26,72 Z M 53,97 A 10,10 0 1 0 53,117 A 10,10 0 1 0 53,97 Z" />
+
+<!-- Paint blobs -->
+<circle cx="47" cy="66" r="9"   fill="#e53935" stroke="#222222" stroke-width="1.5" />
+<circle cx="67" cy="50" r="9"   fill="#fdd835" stroke="#222222" stroke-width="1.5" />
+<circle cx="92" cy="49" r="9"   fill="#43a047" stroke="#222222" stroke-width="1.5" />
+<circle cx="109" cy="68" r="9"  fill="#1e88e5" stroke="#222222" stroke-width="1.5" />
+
+<!-- Brush, lying across the palette: white border first so it stands off the palette -->
+<path fill="#ffffff" stroke="#ffffff" stroke-width="10" stroke-linejoin="round"
+      d="M 101.2,94.8 L 131.2,124.8 A 4.5,4.5 0 0 1 124.8,131.2 L 94.8,101.2 Z M 101.9,94.1 L 91.9,84.1 L 84.1,91.9 L 94.1,101.9 Z M 91.9,84.1 C 88,76 78,68 66,66 C 68,78 76,88 84.1,91.9 Z" />
+<!-- Handle -->
+<path fill="#b23a2a" stroke="#222222" stroke-width="1.5"
+      d="M 101.2,94.8 L 131.2,124.8 A 4.5,4.5 0 0 1 124.8,131.2 L 94.8,101.2 Z" />
+<!-- Ferrule -->
+<path fill="#c7ccd1" stroke="#222222" stroke-width="1.5"
+      d="M 101.9,94.1 L 91.9,84.1 L 84.1,91.9 L 94.1,101.9 Z" />
+<!-- Bristles, with a blue tip of paint -->
+<path fill="#d9a55b" stroke="#222222" stroke-width="1.5"
+      d="M 91.9,84.1 C 88,76 78,68 66,66 C 68,78 76,88 84.1,91.9 Z" />
+<path fill="#1e88e5" stroke="none"
+      d="M 79.5,72.5 C 75,69 71,67 66.6,66.6 C 67,71 69,75 72.5,79.5 C 75,77.5 77.5,75 79.5,72.5 Z" />
+</svg>

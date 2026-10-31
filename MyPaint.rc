@@ -16,6 +16,7 @@ BEGIN
         MENUITEM "&Save\tCtrl+S",           ID_FILE_SAVE
         MENUITEM "Save &As...",             ID_FILE_SAVEAS
         MENUITEM "&Print...\tCtrl+P",       ID_FILE_PRINT
+        MENUITEM "&Delete",                 ID_FILE_DELETE
         MENUITEM SEPARATOR
         MENUITEM "E&xit\tAlt+F4",           ID_FILE_EXIT
     END

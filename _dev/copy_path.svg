@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!-- Copy icon (Fluent "Copy" 24 regular) with its bottom-right corner cut away, plus a folder outline badge in the gap -->
+<!-- Front sheet: rounded rectangle outline, open at the bottom-right -->
+<path d="M20 11V4.25A2.25 2.25 0 0 0 17.75 2H8.75A2.25 2.25 0 0 0 6.5 4.25V17.25A2.25 2.25 0 0 0 8.75 19.5H10.5V18H8.75A0.75 0.75 0 0 1 8 17.25V4.25A0.75 0.75 0 0 1 8.75 3.5H17.75A0.75 0.75 0 0 1 18.5 4.25V11Z" fill="#ffffff"/>
+<!-- Back sheet: the L behind it, cut short before the badge -->
+<path d="M5.5 4.63V17.25A3.25 3.25 0 0 0 8.75 20.5H10.5V22H8.75A4.75 4.75 0 0 1 4 17.25V6.75C4 5.77 4.627 4.935 5.5 4.63Z" fill="#ffffff"/>
+<!-- Folder outline badge -->
+<path d="M13.25 12.5H15.4L16.6 14H21.75A1.25 1.25 0 0 1 23 15.25V20.75A1.25 1.25 0 0 1 21.75 22H13.25A1.25 1.25 0 0 1 12 20.75V13.75A1.25 1.25 0 0 1 13.25 12.5ZM13.5 15.5V20.5H21.5V15.5Z" fill="#ffffff"/>
+</svg>

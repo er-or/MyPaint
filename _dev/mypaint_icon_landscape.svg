@@ -1,0 +1,24 @@
+<svg x="0" y="0" viewBox="0 0 150 150" version="1.1" xmlns="http://www.w3.org/2000/svg">
+<!-- MyPaint app icon: sky, sun and hills on a rounded square that fills the icon.
+     The hills follow the tile's rounded bottom corners (arcs of radius 28), so no clipping is needed.
+     make_icon.ps1 renders this; see the notes at the top of that script for what it supports. -->
+
+<!-- Sky tile -->
+<path fill="#4fa8ec" stroke="#1f5f96" stroke-width="2"
+      d="M 34,6 H 116 A 28,28 0 0 1 144,34 V 116 A 28,28 0 0 1 116,144 H 34 A 28,28 0 0 1 6,116 V 34 A 28,28 0 0 1 34,6 Z" />
+
+<!-- Sun -->
+<circle cx="104" cy="46" r="20" fill="#ffd23a" stroke="#c99a00" stroke-width="2" />
+
+<!-- Mountains: a big peak and a smaller one behind the hill -->
+<path fill="#7cc242" stroke="none"
+      d="M 6,104 L 46,62 Q 54,54 62,62 L 98,98 L 112,86 Q 120,79 128,86 L 144,100 V 116 A 28,28 0 0 1 116,144 H 34 A 28,28 0 0 1 6,116 Z" />
+
+<!-- Front hill -->
+<path fill="#2e9e44" stroke="none"
+      d="M 6,112 C 34,96 62,94 88,106 C 110,116 128,112 144,102 V 116 A 28,28 0 0 1 116,144 H 34 A 28,28 0 0 1 6,116 Z" />
+
+<!-- Tile edge again on top, so the hills don't cover it -->
+<path fill="none" stroke="#1f5f96" stroke-width="2"
+      d="M 34,6 H 116 A 28,28 0 0 1 144,34 V 116 A 28,28 0 0 1 116,144 H 34 A 28,28 0 0 1 6,116 V 34 A 28,28 0 0 1 34,6 Z" />
+</svg>

@@ -15,6 +15,8 @@
 #define ID_FILE_SAVEAS          40004
 #define ID_FILE_EXIT            40005
 #define ID_FILE_PRINT           40007
+#define ID_FILE_DELETE          40008
+#define ID_FILE_INKSCAPE        40009   // added to the File menu at runtime for SVGs
 
 // Menu item IDs — Edit
 #define ID_EDIT_UNDO            40010
