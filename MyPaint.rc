@@ -38,6 +38,7 @@ BEGIN
         MENUITEM "Flip &Horizontal",        ID_IMAGE_FLIP_H
         MENUITEM "Flip &Vertical",          ID_IMAGE_FLIP_V
         MENUITEM SEPARATOR
+        MENUITEM "&Crop to Selection\tCtrl+Shift+X", ID_IMAGE_CROP
         MENUITEM "&Resize Image...",        ID_IMAGE_RESIZE
     END
 END
@@ -55,7 +56,18 @@ BEGIN
     "C",    ID_EDIT_COPY,       VIRTKEY, CONTROL
     "V",    ID_EDIT_PASTE,      VIRTKEY, CONTROL
     "A",    ID_EDIT_SELECT_ALL, VIRTKEY, CONTROL
+    "X",    ID_IMAGE_CROP,      VIRTKEY, CONTROL, SHIFT
     VK_F11, ID_VIEW_DARKMODE,   VIRTKEY
+    // Zoom: Ctrl+= / Ctrl+- (main keys 0xBB / 0xBD, also the numpad), Ctrl+0 fit, Ctrl+1 100%
+    0xBB,   ID_ZOOM_IN,         VIRTKEY, CONTROL
+    0xBB,   ID_ZOOM_IN,         VIRTKEY, CONTROL, SHIFT
+    VK_ADD, ID_ZOOM_IN,         VIRTKEY, CONTROL
+    0xBD,   ID_ZOOM_OUT,        VIRTKEY, CONTROL
+    VK_SUBTRACT, ID_ZOOM_OUT,   VIRTKEY, CONTROL
+    "0",    ID_ZOOM_FIT_WINDOW, VIRTKEY, CONTROL
+    VK_NUMPAD0, ID_ZOOM_FIT_WINDOW, VIRTKEY, CONTROL
+    "1",    ID_ZOOM_ACTUAL,     VIRTKEY, CONTROL
+    VK_NUMPAD1, ID_ZOOM_ACTUAL, VIRTKEY, CONTROL
 END
 
 // Text input dialog

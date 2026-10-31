@@ -8,12 +8,17 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Drawing tools:** pencil, brush, eraser, fill, smudge, text, colour picker
 - **Shapes:** lines, arrows, rectangles, rounded rectangles, ellipses, triangles,
   polygons, stars, hearts, spirals, speech bubbles, check marks and more
-- **Selections:** rectangle, lasso and magic wand, with cut, copy and paste
-- **Image operations:** rotate, flip, resize, undo and redo
+- **Selections:** rectangle, lasso and magic wand, with cut, copy and paste;
+  Ctrl+C with nothing selected copies the whole image
+- **Image operations:** rotate, flip, resize, crop to selection (Ctrl+Shift+X),
+  undo and redo
+- **Opening files:** File → Open, drag and drop onto the window, or
+  File → Open Recent (the last 10 images)
 - **Folder browser:** an optional thumbnail strip for flicking through the
   images in a folder (see below)
 - **Zoom:** fit to window (shrinks large images, never enlarges small ones),
-  fill window, Ctrl + scroll to zoom
+  fill window, Ctrl + scroll; keyboard Ctrl+= / Ctrl+− to zoom, Ctrl+0 to fit,
+  Ctrl+1 for 100%
 - **Dark and light themes**
 - **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP (including the first
   frame of animated WebP) and SVG; saves PNG, JPEG, BMP, GIF, TIFF and WebP.

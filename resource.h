@@ -17,6 +17,8 @@
 #define ID_FILE_PRINT           40007
 #define ID_FILE_DELETE          40008
 #define ID_FILE_INKSCAPE        40009   // added to the File menu at runtime for SVGs
+#define ID_FILE_RECENT_FIRST    41000   // File > Open Recent entries: 41000 + index (up to 10)
+#define ID_FILE_RECENT_CLEAR    41020
 
 // Menu item IDs — Edit
 #define ID_EDIT_UNDO            40010
@@ -32,6 +34,8 @@
 #define ID_ZOOM_EDIT            40503
 #define ID_ZOOM_FIT             40504
 #define ID_FOLDER_BROWSER_BTN        40506
+#define ID_ZOOM_FIT_WINDOW      40507   // Ctrl+0: always fit (the button toggles)
+#define ID_ZOOM_ACTUAL          40508   // Ctrl+1: 100%
 
 // Alpha (opacity) edit
 #define ID_ALPHA_EDIT           40505
@@ -57,6 +61,7 @@
 #define ID_IMAGE_ROTATE_LEFT    40403
 #define ID_IMAGE_FLIP_H         40404
 #define ID_IMAGE_FLIP_V         40405
+#define ID_IMAGE_CROP           40406
 
 // Menu item IDs — Help
 #define ID_HELP_ABOUT           40020
