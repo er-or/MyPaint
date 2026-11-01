@@ -19,7 +19,11 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Zoom:** fit to window (shrinks large images, never enlarges small ones),
   fill window, Ctrl + scroll; keyboard Ctrl+= / Ctrl+− to zoom, Ctrl+0 to fit,
   Ctrl+1 for 100%
-- **Dark and light themes**
+- **Full screen and slideshow (View menu):** F11 shows the image on black;
+  F5 starts a slideshow (3, 5 or 10 seconds per image). The arrow keys and
+  scroll wheel step through the folder, Space pauses, Esc returns; moving the
+  mouse shows a control bar. A folder browser search limits both to its matches.
+- **Dark and light themes** (Ctrl+Shift+D)
 - **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP (including the first
   frame of animated WebP) and SVG; saves PNG, JPEG, BMP, GIF, TIFF and WebP.
   HEIC/HEIF (phone photos) and AVIF also open, using Windows' own decoders

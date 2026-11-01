@@ -165,6 +165,7 @@ static const int FOLDER_BROWSER_MIN_H = 40;   // drag limits: this (room for a p
 static const int FOLDER_LABEL_H       = 16;   // file name line under each thumbnail
 static const int FOLDER_GRIP_H        = 5;    // top edge band that resizes the strip
 static const int FOLDER_SEARCH_W      = 200;  // search panel at the left end of the strip (Ctrl+F)
+static int g_slideSeconds = 5;                // slideshow interval: 3, 5 or 10
 static int g_folderBrowserH = FOLDER_BROWSER_H;  // chosen by dragging the strip's top edge
 static int g_folderCellW    = 112;  // cell width; follows the strip height
 static int g_folderThumbMax = 100;  // size thumbnails are made at; follows the strip height
@@ -675,6 +676,8 @@ static void    FreeFolderThumbs();
 static void    NavigateToFile(int idx);
 static void    ToggleFolderBrowser();
 static void    OpenFolderSearch();
+static void    EnterFullscreen(bool play);
+static void    ExitFullscreen();
 static void    CloseFolderSearch();
 static LRESULT CALLBACK FolderSearchWndProc(HWND, UINT, WPARAM, LPARAM);
 static void    CenterFolderBrowserOnCurrent();
@@ -887,11 +890,13 @@ static void DoRedo()
 // the zoomed-out view cache is rebuilt. Repaints that only move or overlay the
 // view (scrolling, zooming, animations) use InvalidateCanvasView and keep it.
 static unsigned g_canvasVersion = 0;
+static HWND     g_hwndFullscreen = NULL;   // full screen view (View menu), shows the canvas
 
 static void InvalidateCanvas()
 {
     g_canvasVersion++;
     if (g_hwndCanvas) InvalidateRect(g_hwndCanvas, NULL, FALSE);
+    if (g_hwndFullscreen) InvalidateRect(g_hwndFullscreen, NULL, FALSE);
 }
 
 static void InvalidateCanvasView()
@@ -1908,7 +1913,7 @@ static void FinishImageLoad(AsyncImageLoad* r)
     if (_wcsicmp(g_currentFile, req->path.c_str()) == 0) {
         if (g_zoomFitMode) ZoomToFit();
         else               ZoomToCover();
-        if (g_currentTool != TOOL_HAND) SetTool(TOOL_HAND);
+        if (g_showFolderBrowser && g_currentTool != TOOL_HAND) SetTool(TOOL_HAND);
     }
     // On failure the highlight stays on the file that wouldn't open (the
     // canvas keeps the previous image), so the arrow keys carry on past it
@@ -2415,6 +2420,7 @@ static void LoadSettings()
     if (qv(L"DarkMode", &val)) g_darkMode = (val != 0);
     if (qv(L"FolderBrowserFromFile", &val))  g_folderBrowserFromFile  = (val != 0);
     if (qv(L"FolderBrowserFromBlank", &val)) g_folderBrowserFromBlank = (val != 0);
+    if (qv(L"SlideshowSeconds", &val) && (val == 3 || val == 5 || val == 10)) g_slideSeconds = (int)val;
     if (qv(L"FolderBrowserH", &val) && val <= 4000)
         g_folderBrowserH = max(FOLDER_BROWSER_MIN_H, (int)val);
 
@@ -2510,6 +2516,7 @@ static void SaveSettings()
     sv(L"FolderBrowserFromBlank", (DWORD)(g_folderBrowserFromBlank ? 1 : 0));
     RegDeleteValueW(hKey, L"FolderBrowser");   // replaced by the two values above
     sv(L"FolderBrowserH", (DWORD)g_folderBrowserH);
+    sv(L"SlideshowSeconds", (DWORD)g_slideSeconds);
     sv(L"JpegQuality",    (DWORD)g_jpegQuality);
     sv(L"WebpQuality",    (DWORD)g_webpQuality);
     sv(L"WebpLossless",   (DWORD)(g_webpLossless ? 1 : 0));
@@ -4791,8 +4798,8 @@ static void ApplyDarkMode()
         ti.uFlags    = TTF_IDISHWND;
         ti.hwnd      = g_hwndMain;
         ti.uId       = (UINT_PTR)g_hwndBtnDark;
-        ti.lpszText  = g_darkMode ? (LPWSTR)L"Toggle light mode (F11)"
-                                  : (LPWSTR)L"Toggle dark mode (F11)";
+        ti.lpszText  = g_darkMode ? (LPWSTR)L"Toggle light mode (Ctrl+Shift+D)"
+                                  : (LPWSTR)L"Toggle dark mode (Ctrl+Shift+D)";
         SendMessage(g_hwndColorTip, TTM_UPDATETIPTEXT, 0, (LPARAM)&ti);
     }
 
@@ -7119,7 +7126,9 @@ L"Ctrl+0          Fit to window\r\n"
 L"Ctrl+1          Actual size (100%)\r\n"
 L"Ctrl+F          Search file names in the folder browser; in Help,\r\n"
 L"                search this text\r\n"
-L"F11             Toggle dark mode\r\n"
+L"F11             Full screen (View menu); Esc leaves it\r\n"
+L"F5              Slideshow (View menu)\r\n"
+L"Ctrl+Shift+D    Toggle dark mode\r\n"
 L"\r\n"
 L"SHAPES  (after drawing, shape enters Edit Mode)\r\n"
 L"------------------------------------------------\r\n"
@@ -7212,6 +7221,21 @@ L"Scroll wheel        Scroll the canvas (Shift+wheel: sideways)\r\n"
 L"Zoom controls in the status bar (bottom-right)\r\n"
 L"Fit to window       Shrinks large images to fit; small images stay\r\n"
 L"                    at 100% (SVGs still scale up, as they stay sharp)\r\n"
+L"\r\n"
+L"FULL SCREEN AND SLIDESHOW  (View menu)\r\n"
+L"--------------------------------------\r\n"
+L"F11                 Full screen: the image on black, nothing else\r\n"
+L"F5                  Slideshow: full screen, moving to the next image\r\n"
+L"                    every few seconds\r\n"
+L"Left / Right        Previous / next image in the folder (also Up /\r\n"
+L"                    Down, Page Up / Down and the scroll wheel)\r\n"
+L"Home / End          First / last image\r\n"
+L"Space               Start / pause the slideshow\r\n"
+L"Esc, F11            Back to MyPaint (or double-click the image)\r\n"
+L"Mouse               Moving it shows a bar with previous, play /\r\n"
+L"                    pause, next, the interval (3, 5 or 10 seconds;\r\n"
+L"                    click to change) and close\r\n"
+L"A folder browser search (Ctrl+F) limits both to the matching images.\r\n"
 L"\r\n"
 L"FILES\r\n"
 L"-----\r\n"
@@ -10695,18 +10719,15 @@ static HIMAGELIST BuildToolImageList(bool dark)
         SolidBrush br(cDark); g.FillPath(&br, &path);
     });
 
-    // ── 27: View menu — ic_fluent_eye_20_regular ──
+    // ── 27: View menu — outline monitor, after ic_fluent_desktop_20_regular (_dev/desktop.svg) ──
     addIcon([&](Graphics& g) {
         static const char* d =
-            "M3.25909 11.6021C3.94254 8.32689 6.79437 6 10 6C13.2057 6 16.0574 8.32688"
-            " 16.7409 11.6021C16.7974 11.8725 17.0622 12.0459 17.3325 11.9895C17.6029"
-            " 11.933 17.7763 11.6682 17.7199 11.3979C16.9425 7.67312 13.6934 5 10 5"
-            "C6.3066 5 3.05742 7.67311 2.28017 11.3979C2.22377 11.6682 2.39718 11.933"
-            " 2.6675 11.9895C2.93782 12.0459 3.20268 11.8725 3.25909 11.6021Z"
-            "M10 8C8.067 8 6.5 9.567 6.5 11.5C6.5 13.433 8.067 15 10 15C11.933 15 13.5"
-            " 13.433 13.5 11.5C13.5 9.567 11.933 8 10 8ZM7.5 11.5C7.5 10.1193 8.61929 9"
-            " 10 9C11.3807 9 12.5 10.1193 12.5 11.5C12.5 12.8807 11.3807 14 10 14"
-            "C8.61929 14 7.5 12.8807 7.5 11.5Z";
+            "M4.5 3C3.11929 3 2 4.11929 2 5.5V12.5C2 13.8807 3.11929 15 4.5 15H7V16H5.5"
+            "C5.22386 16 5 16.2239 5 16.5C5 16.7761 5.22386 17 5.5 17H14.5C14.7761 17 15"
+            " 16.7761 15 16.5C15 16.2239 14.7761 16 14.5 16H13V15H15.5C16.8807 15 18"
+            " 13.8807 18 12.5V5.5C18 4.11929 16.8807 3 15.5 3H4.5ZM12 15V16H8V15H12Z"
+            "M3 5.5C3 4.67157 3.67157 4 4.5 4H15.5C16.3284 4 17 4.67157 17 5.5V12.5"
+            "C17 13.3284 16.3284 14 15.5 14H4.5C3.67157 14 3 13.3284 3 12.5V5.5Z";
         GraphicsPath path(FillModeWinding);
         AddSvgPath(path, d, 22.0f / 20.0f);
         SolidBrush br(cDark); g.FillPath(&br, &path);
@@ -11179,13 +11200,14 @@ static void CreateToolbar(HWND hwndParent)
         SendMessage(g_hwndToolbar, TB_SETIMAGELIST, 0, (LPARAM)g_hToolImageList);
 
     // Menu bar replacement — image dropdown buttons at the left of the toolbar
-    // Image indices 24-26 correspond to File/Edit/Image icons in BuildToolImageList
-    // View and Help moved to right-aligned HWND overlay buttons (g_hwndBtnDark / g_hwndBtnHelp)
+    // Image indices 24-27 correspond to File/Edit/Image/View icons in BuildToolImageList;
+    // Help and the dark mode toggle are right-aligned HWND overlay buttons (g_hwndBtnHelp / g_hwndBtnDark)
     {
         TBBUTTON mb[] = {
             {24, ID_MENU_FILE,  TBSTATE_ENABLED, BTNS_DROPDOWN|BTNS_AUTOSIZE, {0}, 0, -1},
             {25, ID_MENU_EDIT,  TBSTATE_ENABLED, BTNS_DROPDOWN|BTNS_AUTOSIZE, {0}, 0, -1},
             {26, ID_MENU_IMAGE, TBSTATE_ENABLED, BTNS_DROPDOWN|BTNS_AUTOSIZE, {0}, 0, -1},
+            {27, ID_MENU_VIEW,  TBSTATE_ENABLED, BTNS_DROPDOWN|BTNS_AUTOSIZE, {0}, 0, -1},
             {0,  0,             TBSTATE_ENABLED, BTNS_SEP,                     {0}, 0, -1},
         };
         SendMessage(g_hwndToolbar, TB_ADDBUTTONS, ARRAYSIZE(mb), (LPARAM)mb);
@@ -12930,6 +12952,350 @@ static LRESULT CALLBACK FolderSearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
     }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// ─── Full screen and slideshow (View menu) ───────────────────
+// A black window over the whole monitor showing the open image, fitted
+// (small images are not enlarged, SVGs are re-rendered to fill it). The arrow
+// keys step through the folder, honouring a folder browser search. Moving the
+// mouse shows a control bar; the slideshow advances every g_slideSeconds.
+static const UINT_PTR FS_SLIDE_TIMER = 1;
+static const UINT_PTR FS_IDLE_TIMER  = 2;   // hides the bar and pointer when the mouse rests
+static const DWORD    FS_IDLE_MS     = 2500;
+
+static bool    g_fsPlaying     = false;
+static bool    g_fsBarVisible  = false;
+static bool    g_fsOwnsList    = false;   // the folder list was built for full screen (strip closed)
+static DWORD   g_fsLastMove    = 0;
+static POINT   g_fsLastPt      = { -1, -1 };
+static int     g_fsHot         = -1;      // control bar button under the mouse
+static Bitmap* g_fsCache       = nullptr; // the image at its full screen size
+static Bitmap* g_fsCacheSrc    = nullptr;
+static unsigned g_fsCacheVersion = 0;
+static SIZE    g_fsCacheFor    = {};
+
+enum { FSB_PREV, FSB_PLAY, FSB_NEXT, FSB_INTERVAL, FSB_EXIT, FSB_COUNT };
+
+// Control bar, centred near the bottom; the file name fills the middle
+static RECT FsBarRect(int w, int h) { int bw = min(560, w - 32); return { (w - bw) / 2, h - 80, (w + bw) / 2, h - 32 }; }
+static RECT FsButtonRect(int w, int h, int b)
+{
+    RECT r = FsBarRect(w, h);
+    switch (b) {
+    case FSB_PREV:     return { r.left + 8,   r.top + 4, r.left + 48,  r.bottom - 4 };
+    case FSB_PLAY:     return { r.left + 48,  r.top + 4, r.left + 88,  r.bottom - 4 };
+    case FSB_NEXT:     return { r.left + 88,  r.top + 4, r.left + 128, r.bottom - 4 };
+    case FSB_INTERVAL: return { r.right - 104, r.top + 4, r.right - 48, r.bottom - 4 };
+    case FSB_EXIT:     return { r.right - 48, r.top + 4, r.right - 8,  r.bottom - 4 };
+    }
+    return {};
+}
+static int FsButtonAt(HWND hwnd, POINT pt)
+{
+    if (!g_fsBarVisible) return -1;
+    RECT rc; GetClientRect(hwnd, &rc);
+    for (int b = 0; b < FSB_COUNT; b++) { RECT r = FsButtonRect(rc.right, rc.bottom, b); if (PtInRect(&r, pt)) return b; }
+    return -1;
+}
+
+static void FsFreeCache() { delete g_fsCache; g_fsCache = nullptr; g_fsCacheSrc = nullptr; }
+
+// Makes g_fsCache: the open image scaled to fit w × h
+static void FsBuildCache(int w, int h)
+{
+    if (g_fsCache && g_fsCacheSrc == g_pCanvas && g_fsCacheVersion == g_canvasVersion &&
+        g_fsCacheFor.cx == w && g_fsCacheFor.cy == h) return;
+    FsFreeCache();
+    if (!g_pCanvas || w <= 0 || h <= 0) return;
+    g_fsCacheSrc = g_pCanvas; g_fsCacheVersion = g_canvasVersion; g_fsCacheFor = { w, h };
+    int cw = (int)g_pCanvas->GetWidth(), ch = (int)g_pCanvas->GetHeight();
+    // An unedited SVG is drawn again at the size it is shown, so it stays sharp
+    if (g_isSvgFile && !g_modified && g_currentFile[0] && g_svgCanvasScale > 0) {
+        double ow = cw / g_svgCanvasScale, oh = ch / g_svgCanvasScale;
+        if (Bitmap* b = LoadSvgToBitmap(g_currentFile, (float)min(w / ow, h / oh))) { g_fsCache = b; return; }
+    }
+    double s = min((double)w / cw, (double)h / ch);
+    if (s > 1.0 && !g_isSvgFile) s = 1.0;
+    int dw = max(1, (int)(cw * s + 0.5)), dh = max(1, (int)(ch * s + 0.5));
+    g_fsCache = new Bitmap(dw, dh, PixelFormat32bppPARGB);
+    if (g_fsCache->GetLastStatus() != Ok) { FsFreeCache(); return; }
+    Graphics g(g_fsCache);
+    g.SetInterpolationMode(s < 1.0 ? InterpolationModeHighQualityBicubic : InterpolationModeHighQualityBilinear);
+    g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    g.DrawImage(g_pCanvas, 0, 0, dw, dh);
+}
+
+// Steps through the folder list: dir -1 / +1 wraps around; 0 with toEnd
+// goes to the first (toEnd < 0) or last (toEnd > 0) image
+static void FsStep(int dir, int toEnd = 0)
+{
+    int n = (int)g_folderEntries.size();
+    if (n == 0) return;
+    int cur = g_folderCurrentIdx;
+    for (int i = 0; cur < 0 && i < n; i++)
+        if (_wcsicmp(g_folderEntries[i].path.c_str(), g_currentFile) == 0) cur = i;
+    int idx = toEnd < 0 ? 0 : toEnd > 0 ? n - 1
+            : cur < 0 ? (dir > 0 ? 0 : n - 1) : (cur + dir + n) % n;
+    NavigateToFile(idx);
+}
+
+static void FsRestartSlideTimer()
+{
+    if (!g_hwndFullscreen) return;
+    KillTimer(g_hwndFullscreen, FS_SLIDE_TIMER);
+    if (g_fsPlaying) SetTimer(g_hwndFullscreen, FS_SLIDE_TIMER, g_slideSeconds * 1000, NULL);
+}
+
+static void FsSetPlaying(bool play)
+{
+    g_fsPlaying = play && g_folderEntries.size() > 1;
+    FsRestartSlideTimer();
+    if (g_hwndFullscreen) InvalidateRect(g_hwndFullscreen, NULL, FALSE);
+}
+
+static void FsShowBar(HWND hwnd)
+{
+    g_fsLastMove = GetTickCount();
+    if (!g_fsBarVisible) { g_fsBarVisible = true; InvalidateRect(hwnd, NULL, FALSE); }
+    SetCursor(LoadCursor(NULL, IDC_ARROW));
+}
+
+static void FsPress(HWND hwnd, int b)
+{
+    switch (b) {
+    case FSB_PREV: FsStep(-1); FsRestartSlideTimer(); break;
+    case FSB_NEXT: FsStep(+1); FsRestartSlideTimer(); break;
+    case FSB_PLAY: FsSetPlaying(!g_fsPlaying); break;
+    case FSB_INTERVAL:
+        g_slideSeconds = g_slideSeconds == 3 ? 5 : g_slideSeconds == 5 ? 10 : 3;
+        FsRestartSlideTimer();
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    case FSB_EXIT: ExitFullscreen(); break;
+    }
+}
+
+static void FsPaintBar(Graphics& g, int w, int h)
+{
+    RECT r = FsBarRect(w, h);
+    GraphicsPath bg;
+    const float rad = 10.f;
+    float L = (float)r.left, T = (float)r.top, R = (float)r.right, B = (float)r.bottom;
+    bg.AddArc(L, T, 2*rad, 2*rad, 180, 90); bg.AddArc(R - 2*rad, T, 2*rad, 2*rad, 270, 90);
+    bg.AddArc(R - 2*rad, B - 2*rad, 2*rad, 2*rad, 0, 90); bg.AddArc(L, B - 2*rad, 2*rad, 2*rad, 90, 90);
+    bg.CloseFigure();
+    SolidBrush bgBr(Color(215, 32, 32, 32));
+    g.FillPath(&bgBr, &bg);
+
+    SolidBrush hotBr(Color(255, 70, 70, 70));
+    SolidBrush fg(Color(255, 235, 235, 235));
+    Pen fgPen(Color(255, 235, 235, 235), 2.f);
+    for (int b = 0; b < FSB_COUNT; b++) {
+        RECT br = FsButtonRect(w, h, b);
+        float cx = (br.left + br.right) / 2.f, cy = (br.top + br.bottom) / 2.f;
+        if (b == g_fsHot) g.FillEllipse(&hotBr, cx - 17.f, cy - 17.f, 34.f, 34.f);
+        switch (b) {
+        case FSB_PREV: case FSB_NEXT: {
+            float s = b == FSB_NEXT ? 1.f : -1.f;
+            PointF tri[3] = { {cx - 5*s, cy - 7}, {cx + 5*s, cy}, {cx - 5*s, cy + 7} };
+            g.FillPolygon(&fg, tri, 3);
+            g.FillRectangle(&fg, s > 0 ? cx + 5.f : cx - 7.f, cy - 7.f, 2.f, 14.f);
+            break;
+        }
+        case FSB_PLAY:
+            if (g_fsPlaying) { g.FillRectangle(&fg, cx - 6.f, cy - 8.f, 4.f, 16.f); g.FillRectangle(&fg, cx + 2.f, cy - 8.f, 4.f, 16.f); }
+            else { PointF tri[3] = { {cx - 5, cy - 9}, {cx + 9, cy}, {cx - 5, cy + 9} }; g.FillPolygon(&fg, tri, 3); }
+            break;
+        case FSB_EXIT:
+            g.DrawLine(&fgPen, cx - 6.f, cy - 6.f, cx + 6.f, cy + 6.f);
+            g.DrawLine(&fgPen, cx + 6.f, cy - 6.f, cx - 6.f, cy + 6.f);
+            break;
+        }
+    }
+    FontFamily ff(L"Segoe UI");
+    Font font(&ff, 10.f, FontStyleRegular, UnitPoint);
+    StringFormat sf;
+    sf.SetAlignment(StringAlignmentCenter); sf.SetLineAlignment(StringAlignmentCenter);
+    sf.SetTrimming(StringTrimmingEllipsisCharacter); sf.SetFormatFlags(StringFormatFlagsNoWrap);
+    // Interval: click to cycle 3 / 5 / 10 seconds
+    RECT ir = FsButtonRect(w, h, FSB_INTERVAL);
+    if (g_fsHot == FSB_INTERVAL) {
+        RectF hr((REAL)ir.left, (REAL)ir.top + 6, (REAL)(ir.right - ir.left), (REAL)(ir.bottom - ir.top) - 12);
+        g.FillRectangle(&hotBr, hr);
+    }
+    wchar_t secs[16]; StringCchPrintfW(secs, 16, L"%d s", g_slideSeconds);
+    g.DrawString(secs, -1, &font, RectF((REAL)ir.left, (REAL)ir.top, (REAL)(ir.right - ir.left), (REAL)(ir.bottom - ir.top)), &sf, &fg);
+    // File name, and its place in the folder
+    RECT nb = FsButtonRect(w, h, FSB_NEXT);
+    std::wstring name = g_currentFile[0] ? PathFindFileNameW(g_currentFile) : L"Untitled";
+    int n = (int)g_folderEntries.size();
+    if (n > 0 && g_folderCurrentIdx >= 0)
+        name += L"   " + std::to_wstring(g_folderCurrentIdx + 1) + L" / " + std::to_wstring(n);
+    RectF nr((REAL)nb.right + 8, (REAL)r.top, (REAL)(ir.left - nb.right - 16), (REAL)(r.bottom - r.top));
+    g.DrawString(name.c_str(), -1, &font, nr, &sf, &fg);
+}
+
+static LRESULT CALLBACK FullscreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        Bitmap back(rc.right, rc.bottom, PixelFormat32bppPARGB);
+        {
+            Graphics g(&back);
+            g.Clear(Color(255, 0, 0, 0));
+            FsBuildCache(rc.right, rc.bottom);
+            if (g_fsCache) {
+                int dw = (int)g_fsCache->GetWidth(), dh = (int)g_fsCache->GetHeight();
+                g.DrawImage(g_fsCache, (rc.right - dw) / 2, (rc.bottom - dh) / 2, dw, dh);
+            }
+            if (g_fsBarVisible) {
+                g.SetSmoothingMode(SmoothingModeAntiAlias);
+                g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+                FsPaintBar(g, rc.right, rc.bottom);
+            }
+        }
+        Graphics screen(hdc);
+        screen.DrawImage(&back, 0, 0, rc.right, rc.bottom);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) { SetCursor(g_fsBarVisible ? LoadCursor(NULL, IDC_ARROW) : NULL); return TRUE; }
+        break;
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        // Windows repeats WM_MOUSEMOVE without movement (e.g. after repaints)
+        if (pt.x == g_fsLastPt.x && pt.y == g_fsLastPt.y) return 0;
+        g_fsLastPt = pt;
+        FsShowBar(hwnd);
+        int hot = FsButtonAt(hwnd, pt);
+        if (hot != g_fsHot) { g_fsHot = hot; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int b = FsButtonAt(hwnd, pt);
+        if (b >= 0) FsPress(hwnd, b);
+        else FsShowBar(hwnd);
+        return 0;
+    }
+
+    case WM_LBUTTONDBLCLK: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int b = FsButtonAt(hwnd, pt);
+        if (b >= 0) FsPress(hwnd, b);   // quick clicks on a button are two presses
+        else ExitFullscreen();
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL:
+        FsStep(GET_WHEEL_DELTA_WPARAM(wParam) < 0 ? +1 : -1);
+        FsRestartSlideTimer();
+        return 0;
+
+    case WM_KEYDOWN:
+        switch (wParam) {
+        case VK_ESCAPE: case VK_F11: ExitFullscreen(); break;
+        case VK_SPACE:  case VK_F5:  FsSetPlaying(!g_fsPlaying); break;
+        case VK_RIGHT: case VK_DOWN: case VK_NEXT:  FsStep(+1); FsRestartSlideTimer(); break;
+        case VK_LEFT:  case VK_UP:   case VK_PRIOR: FsStep(-1); FsRestartSlideTimer(); break;
+        case VK_HOME: FsStep(0, -1); FsRestartSlideTimer(); break;
+        case VK_END:  FsStep(0, +1); FsRestartSlideTimer(); break;
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == FS_SLIDE_TIMER) {
+            // Wait while a file is still loading or a message (e.g. save
+            // changes?) is up and has disabled the main window, rather than
+            // piling up loads behind it
+            if (g_imageLoading || !IsWindowEnabled(g_hwndMain)) return 0;
+            FsStep(+1);
+            return 0;
+        }
+        if (wParam == FS_IDLE_TIMER) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+            if (g_fsBarVisible && GetTickCount() - g_fsLastMove > FS_IDLE_MS && FsButtonAt(hwnd, pt) < 0) {
+                g_fsBarVisible = false;
+                g_fsHot = -1;
+                InvalidateRect(hwnd, NULL, FALSE);
+                if (GetForegroundWindow() == hwnd) SetCursor(NULL);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:   // Alt+F4 leaves full screen rather than closing MyPaint
+        ExitFullscreen();
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, FS_SLIDE_TIMER);
+        KillTimer(hwnd, FS_IDLE_TIMER);
+        FsFreeCache();
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void EnterFullscreen(bool play)
+{
+    if (!g_hwndFullscreen) {
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSEX wc = {};
+            wc.cbSize        = sizeof(wc);
+            wc.style         = CS_DBLCLKS;
+            wc.lpfnWndProc   = FullscreenWndProc;
+            wc.hInstance     = GetModuleHandle(NULL);
+            wc.lpszClassName = L"MyPaintFullscreen";
+            wc.hIcon         = (HICON)GetClassLongPtr(g_hwndMain, GCLP_HICON);
+            registered = RegisterClassEx(&wc) != 0;
+        }
+        EndFolderRename(true);
+        // The arrow keys need the folder list, which only exists while the strip is open
+        g_fsOwnsList = !g_showFolderBrowser;
+        if (g_fsOwnsList) BuildFolderList();
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(MonitorFromWindow(g_hwndMain, MONITOR_DEFAULTTONEAREST), &mi);
+        RECT m = mi.rcMonitor;
+        g_fsBarVisible = false; g_fsHot = -1; g_fsLastPt = { -1, -1 };
+        g_hwndFullscreen = CreateWindowEx(0, L"MyPaintFullscreen", APP_TITLE, WS_POPUP,
+            m.left, m.top, m.right - m.left, m.bottom - m.top, g_hwndMain, NULL, GetModuleHandle(NULL), NULL);
+        if (!g_hwndFullscreen) { if (g_fsOwnsList) FreeFolderThumbs(); return; }
+        ShowWindow(g_hwndFullscreen, SW_SHOW);
+        SetForegroundWindow(g_hwndFullscreen);
+        SetFocus(g_hwndFullscreen);
+        SetTimer(g_hwndFullscreen, FS_IDLE_TIMER, 500, NULL);
+        FsShowBar(g_hwndFullscreen);   // show the controls briefly, so they can be found
+    }
+    FsSetPlaying(play);
+}
+
+static void ExitFullscreen()
+{
+    HWND fs = g_hwndFullscreen;
+    if (!fs) return;
+    g_hwndFullscreen = NULL;
+    g_fsPlaying = false;
+    DestroyWindow(fs);
+    if (g_fsOwnsList && !g_showFolderBrowser) FreeFolderThumbs();
+    g_fsOwnsList = false;
+    SetForegroundWindow(g_hwndMain);
+    if (g_showFolderBrowser && g_hwndFolderBrowser) {
+        CenterFolderBrowserOnCurrent();
+        InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
+        SetFocus(g_hwndFolderBrowser);
+    } else if (g_hwndCanvas) SetFocus(g_hwndCanvas);
 }
 
 // ============================================================
@@ -14797,8 +15163,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             if (g_hwndBtnDark) {
                 ti.uId      = (UINT_PTR)g_hwndBtnDark;
-                ti.lpszText = g_darkMode ? (LPWSTR)L"Toggle light mode (F11)"
-                                         : (LPWSTR)L"Toggle dark mode (F11)";
+                ti.lpszText = g_darkMode ? (LPWSTR)L"Toggle light mode (Ctrl+Shift+D)"
+                                         : (LPWSTR)L"Toggle dark mode (Ctrl+Shift+D)";
                 SendMessage(g_hwndColorTip, TTM_ADDTOOL, 0, (LPARAM)&ti);
             }
             if (g_hwndBtnHelp) {
@@ -15058,6 +15424,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         case ID_FOLDER_SEARCH:
             OpenFolderSearch();
+            break;
+        case ID_VIEW_FULLSCREEN:
+            if (g_hwndFullscreen) ExitFullscreen(); else EnterFullscreen(false);
+            break;
+        case ID_VIEW_SLIDESHOW:
+            EnterFullscreen(true);
             break;
         case ID_ZOOM_FIT_WINDOW:
             ZoomToFit();
@@ -15382,6 +15754,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 case ID_MENU_FILE:  subIdx = 0; break;
                 case ID_MENU_EDIT:  subIdx = 1; break;
                 case ID_MENU_IMAGE: subIdx = 2; break;
+                case ID_MENU_VIEW:  subIdx = 3; break;
             }
             if (subIdx >= 0 && g_hMenuMain) {
                 // Refresh Edit menu state before showing
@@ -15402,6 +15775,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     EnableMenuItem(hEdit, ID_EDIT_COPY,  MF_BYCOMMAND | (g_pCanvas ? MF_ENABLED : MF_GRAYED));   // whole image when nothing is selected
                     EnableMenuItem(hEdit, ID_EDIT_PASTE, MF_BYCOMMAND | (IsClipboardFormatAvailable(CF_DIB) ? MF_ENABLED : MF_GRAYED));
                 }
+                if (subIdx == 3) {
+                    HMENU hView = GetSubMenu(g_hMenuMain, 3);
+                    CheckMenuItem(hView, ID_FOLDER_BROWSER_BTN, MF_BYCOMMAND | (g_showFolderBrowser ? MF_CHECKED : MF_UNCHECKED));
+                    CheckMenuItem(hView, ID_VIEW_DARKMODE,      MF_BYCOMMAND | (g_darkMode ? MF_CHECKED : MF_UNCHECKED));
+                }
                 HMENU hPopup = GetSubMenu(g_hMenuMain, subIdx);
                 RECT rc = {};
                 int idx = (int)SendMessage(g_hwndToolbar, TB_COMMANDTOINDEX, nmtb->iItem, 0);
@@ -15417,6 +15795,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 case ID_MENU_FILE:    p->lpszText = (LPWSTR)L"File";      break;
                 case ID_MENU_EDIT:    p->lpszText = (LPWSTR)L"Edit";      break;
                 case ID_MENU_IMAGE:   p->lpszText = (LPWSTR)L"Image";     break;
+                case ID_MENU_VIEW:    p->lpszText = (LPWSTR)L"View";      break;
                 case ID_MENU_MORE:    p->lpszText = (LPWSTR)L"Shapes"; break;
                 case ID_MENU_TOOLS:   p->lpszText = (LPWSTR)L"Tools";      break;
                 case ID_TOOL_PENCIL:  p->lpszText = (LPWSTR)L"Pencil";    break;
@@ -15683,6 +16062,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
         // not the image; Ctrl+F still reaches the search
         bool inStripEdit = msg.hwnd && (msg.hwnd == g_hwndFolderSearchEdit || msg.hwnd == g_hwndFolderRename) &&
                            !(msg.message == WM_KEYDOWN && msg.wParam == 'F');
+        // Full screen is for looking: its keys move through the folder, and
+        // editing shortcuts must not change the hidden image
+        if (msg.hwnd && msg.hwnd == g_hwndFullscreen) inStripEdit = true;
         if (inStripEdit || !TranslateAccelerator(hwnd, hAccel, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);

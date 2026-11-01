@@ -44,6 +44,8 @@
 
 // View menu
 #define ID_VIEW_DARKMODE        40601
+#define ID_VIEW_FULLSCREEN      40602   // F11
+#define ID_VIEW_SLIDESHOW       40603   // F5
 
 // Toolbar menu-bar replacement button IDs
 #define ID_MENU_FILE            40801
