@@ -4671,6 +4671,8 @@ static void SetImageMenuIcons()
 
 // View menu entries. Zoom, folder browser and dark mode reuse their status bar
 // and toolbar artwork; svgD == nullptr items are drawn in SetViewMenuIcons.
+// The last item names the theme it switches to, like the toolbar's moon / sun
+// button: it is swapped for kViewMenuLightMode while dark mode is on.
 static const ImageMenuEntry kViewMenuEntries[] = {
     { ID_VIEW_FULLSCREEN,    L"&Full Screen\tF11",        nullptr,             16.0f },
     { ID_VIEW_SLIDESHOW,     L"&Slideshow\tF5",           nullptr,             16.0f },
@@ -4681,6 +4683,8 @@ static const ImageMenuEntry kViewMenuEntries[] = {
     { ID_FOLDER_BROWSER_BTN, L"Folder &Browser",          kFolderBrowserIconD, 20.0f },
     { ID_VIEW_DARKMODE,      L"&Dark Mode\tCtrl+Shift+D", kMoonD,              24.0f },
 };
+static const ImageMenuEntry kViewMenuLightMode =
+    { ID_VIEW_DARKMODE,      L"&Light Mode\tCtrl+Shift+D", kSunD,              24.0f };
 
 // Sets View menu item icons, in the same style as SetImageMenuIcons
 static void SetViewMenuIcons()
@@ -4698,7 +4702,8 @@ static void SetViewMenuIcons()
     Color iconClr(255, GetRValue(crIcon), GetGValue(crIcon), GetBValue(crIcon));
 
     for (int i = 0; i < (int)ARRAYSIZE(kViewMenuEntries); i++) {
-        const ImageMenuEntry& e = kViewMenuEntries[i];
+        const ImageMenuEntry& e = (kViewMenuEntries[i].cmdId == ID_VIEW_DARKMODE && g_darkMode)
+                                  ? kViewMenuLightMode : kViewMenuEntries[i];
         Bitmap bmp(sz, sz, PixelFormat32bppRGB);
         {
             Graphics g(&bmp);
@@ -15868,7 +15873,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (subIdx == 3) {
                     HMENU hView = GetSubMenu(g_hMenuMain, 3);
                     CheckMenuItem(hView, ID_FOLDER_BROWSER_BTN, MF_BYCOMMAND | (g_showFolderBrowser ? MF_CHECKED : MF_UNCHECKED));
-                    CheckMenuItem(hView, ID_VIEW_DARKMODE,      MF_BYCOMMAND | (g_darkMode ? MF_CHECKED : MF_UNCHECKED));
                 }
                 HMENU hPopup = GetSubMenu(g_hMenuMain, subIdx);
                 RECT rc = {};

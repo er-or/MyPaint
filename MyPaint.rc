@@ -53,7 +53,7 @@ BEGIN
         MENUITEM "&Actual Size\tCtrl+1",    ID_ZOOM_ACTUAL
         MENUITEM SEPARATOR
         MENUITEM "Folder &Browser",         ID_FOLDER_BROWSER_BTN
-        MENUITEM "&Dark Mode\tCtrl+Shift+D", ID_VIEW_DARKMODE
+        MENUITEM "&Dark Mode\tCtrl+Shift+D", ID_VIEW_DARKMODE   // "Light Mode" while dark (SetViewMenuIcons)
     END
 END
 
