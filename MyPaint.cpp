@@ -1079,6 +1079,54 @@ static Bitmap* MakeBitmapFromPixels(const DecodedImage& img)
     return bmp;
 }
 
+// ─── EXIF orientation ────────────────────────────────────────
+// Phones and cameras often store a photo as the sensor saw it and add an EXIF
+// Orientation tag (1-8) saying how to turn it for display. Decoders hand back
+// the stored pixels, so MyPaint applies the tag itself. HEIC/AVIF are left
+// alone: they carry their own rotation, which Windows' decoder handles.
+static bool UsesExifOrientation(const wchar_t* path)
+{
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return false;
+    for (auto e : { L"jpg", L"jpeg", L"jpe", L"jfif", L"tif", L"tiff" }) if (_wcsicmp(dot + 1, e) == 0) return true;
+    return false;
+}
+
+// The Orientation tag of a GDI+ image, 1 (upright) when there is none
+static int GetExifOrientation(Image* img)
+{
+    UINT size = img->GetPropertyItemSize(PropertyTagOrientation);
+    if (size < sizeof(PropertyItem) + sizeof(USHORT)) return 1;
+    std::vector<BYTE> buf(size);
+    auto* item = (PropertyItem*)buf.data();
+    if (img->GetPropertyItem(PropertyTagOrientation, size, item) != Ok || item->type != PropertyTagTypeShort) return 1;
+    int o = *(USHORT*)item->value;
+    return (o >= 1 && o <= 8) ? o : 1;
+}
+
+// The turn that displays an image tagged o upright
+static RotateFlipType ExifOrientationToRotateFlip(int o)
+{
+    switch (o) {
+    case 2: return RotateNoneFlipX;
+    case 3: return Rotate180FlipNone;
+    case 4: return Rotate180FlipX;      // = flip vertically
+    case 5: return Rotate90FlipX;       // transpose
+    case 6: return Rotate90FlipNone;
+    case 7: return Rotate270FlipX;      // transverse
+    case 8: return Rotate270FlipNone;
+    }
+    return RotateNoneFlipNone;
+}
+
+// Turns a GDI+ bitmap loaded from path upright, if its tag says so
+static void ApplyExifOrientation(Bitmap* bmp, const wchar_t* path)
+{
+    if (!bmp || !UsesExifOrientation(path)) return;
+    int o = GetExifOrientation(bmp);
+    if (o != 1) bmp->RotateFlip(ExifOrientationToRotateFlip(o));
+}
+
 // Decodes the formats Windows Imaging Component handles (PNG, JPEG, BMP,
 // GIF, TIFF, ...); first frame only, like Bitmap::FromFile. COM must be
 // initialised on the calling thread.
@@ -1089,6 +1137,7 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr
     IWICImagingFactory*    fac   = nullptr;
     IWICBitmapDecoder*     dec   = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapFlipRotator* turn  = nullptr;
     IWICFormatConverter*   conv  = nullptr;
     UINT w = 0, h = 0;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -1096,8 +1145,36 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr
     if (SUCCEEDED(hr)) hr = fac->CreateDecoderFromFilename(file, nullptr, GENERIC_READ,
                                                            WICDecodeMetadataCacheOnDemand, &dec);
     if (SUCCEEDED(hr)) hr = dec->GetFrame(0, &frame);
+    // EXIF Orientation: turn the photo upright on the way through
+    IWICBitmapSource* src = frame;
+    if (SUCCEEDED(hr) && UsesExifOrientation(file)) {
+        int o = 1;
+        IWICMetadataQueryReader* qr = nullptr;
+        if (SUCCEEDED(frame->GetMetadataQueryReader(&qr))) {
+            const wchar_t* dot = wcsrchr(file, L'.');
+            bool tiff = dot && (_wcsicmp(dot + 1, L"tif") == 0 || _wcsicmp(dot + 1, L"tiff") == 0);
+            PROPVARIANT v; PropVariantInit(&v);
+            if (SUCCEEDED(qr->GetMetadataByName(tiff ? L"/ifd/{ushort=274}" : L"/app1/ifd/{ushort=274}", &v)) &&
+                v.vt == VT_UI2 && v.uiVal >= 1 && v.uiVal <= 8)
+                o = v.uiVal;
+            PropVariantClear(&v);
+            qr->Release();
+        }
+        // WIC flips before it turns (GDI+ turns first), so 5 and 7 pair the
+        // opposite turn with the flip compared with ExifOrientationToRotateFlip
+        static const WICBitmapTransformOptions kTurn[9] = {
+            WICBitmapTransformRotate0, WICBitmapTransformRotate0, WICBitmapTransformFlipHorizontal,
+            WICBitmapTransformRotate180, WICBitmapTransformFlipVertical,
+            (WICBitmapTransformOptions)(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal),
+            WICBitmapTransformRotate90,
+            (WICBitmapTransformOptions)(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
+            WICBitmapTransformRotate270 };
+        if (o != 1 && SUCCEEDED(fac->CreateBitmapFlipRotator(&turn)) &&
+            SUCCEEDED(turn->Initialize(frame, kTurn[o])))
+            src = turn;
+    }
     if (SUCCEEDED(hr)) hr = fac->CreateFormatConverter(&conv);
-    if (SUCCEEDED(hr)) hr = conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+    if (SUCCEEDED(hr)) hr = conv->Initialize(src, GUID_WICPixelFormat32bppBGRA,
                                              WICBitmapDitherTypeNone, nullptr, 0.0,
                                              WICBitmapPaletteTypeCustom);
     if (SUCCEEDED(hr)) hr = conv->GetSize(&w, &h);
@@ -1108,6 +1185,7 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr
         hr = conv->CopyPixels(nullptr, w * 4, (UINT)out.px.size(), out.px.data());
     }
     if (conv)  conv->Release();
+    if (turn)  turn->Release();
     if (frame) frame->Release();
     if (dec)   dec->Release();
     if (fac)   fac->Release();
@@ -1628,6 +1706,7 @@ static void LoadImageFromPath(const wchar_t* file)
         HRESULT hrWebP = S_OK;
         const wchar_t* webpStep = nullptr;
         bmp = isWebP ? LoadWebP(file, &hrWebP, &webpStep) : Bitmap::FromFile(file);
+        if (!isWebP && bmp && bmp->GetLastStatus() == Ok) ApplyExifOrientation(bmp, file);
         if (!isWebP && (!bmp || bmp->GetLastStatus() != Ok)) {
             // GDI+ can't read HEIC, AVIF and some others; Windows' WIC codecs can
             delete bmp;
@@ -3192,6 +3271,7 @@ static Bitmap* MakeFolderThumb(const wchar_t* path)
     } else {
         src = Bitmap::FromFile(path);
         if (src && src->GetLastStatus() != Ok) { delete src; src = nullptr; }
+        ApplyExifOrientation(src, path);
         if (!src) src = LoadBitmapViaWic(path);   // HEIC, AVIF and others GDI+ can't read
     }
     if (!src) return nullptr;
@@ -3330,6 +3410,20 @@ static bool RotateImageFileOnDisk(const wchar_t* path, bool clockwise)
         Image* img = Image::FromFile(path);   // keeps the file open until deleted
         CLSID enc;
         if (img && img->GetLastStatus() == Ok && GetSaveEncoder(path, enc)) {
+            // The stored pixels turn but the Orientation tag is kept, and is
+            // applied after them. Plain turns still come out right; a mirroring
+            // tag must swap axes (flip horizontal <-> vertical, 5 <-> 7).
+            if (UsesExifOrientation(path)) {
+                static const USHORT kSwapped[9] = { 1, 1, 4, 3, 2, 7, 6, 5, 8 };
+                int o = GetExifOrientation(img);
+                if (kSwapped[o] != o) {
+                    USHORT v = kSwapped[o];
+                    PropertyItem item;
+                    item.id = PropertyTagOrientation; item.length = sizeof(v);
+                    item.type = PropertyTagTypeShort; item.value = &v;
+                    img->SetPropertyItem(&item);
+                }
+            }
             EncoderParameters ep;
             ep.Count = 1;
             ep.Parameter[0].NumberOfValues = 1;
@@ -7127,7 +7221,11 @@ L"                    Windows has Microsoft's free Store extensions:\r\n"
 L"                    HEIF Image Extensions (and HEVC Video Extensions\r\n"
 L"                    for most phone photos), or AV1 Video Extension.\r\n"
 L"                    Saves PNG, JPEG, WebP, GIF, TIFF and BMP.\r\n"
-L"Drag and drop       Drop an image file onto the window to open it\r\n"
+L"Photo orientation   Photos that store which way is up (as phones\r\n"
+L"                    and cameras do) open upright, in the window, the\r\n"
+L"                    thumbnails and when copied. Saving keeps them\r\n"
+L"                    upright.\r\n"
+L"Drag and drop      Drop an image file onto the window to open it\r\n"
 L"File > Open Recent  The last 10 images opened or saved\r\n"
 L"File > Delete       Send the open image to the Recycle Bin and\r\n"
 L"                    open the next image in its folder\r\n"
@@ -12105,6 +12203,7 @@ static Bitmap* LoadBitmapForCopy(const wchar_t* path)
     if (dot && _wcsicmp(dot + 1, L"webp") == 0) return LoadWebP(path);
     Bitmap* bmp = Bitmap::FromFile(path);
     if (bmp && bmp->GetLastStatus() != Ok) { delete bmp; bmp = nullptr; }
+    ApplyExifOrientation(bmp, path);
     if (!bmp) bmp = LoadBitmapViaWic(path);   // HEIC, AVIF and others GDI+ can't read
     return bmp;
 }

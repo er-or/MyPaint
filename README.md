@@ -27,6 +27,9 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   Video Extensions for most phone photos; AV1 Video Extension for AVIF).
   Without them, MyPaint explains what to install.
   An SVG is never overwritten: Save on one opens Save As with a PNG name.
+- **Photo orientation:** JPEG and TIFF photos tagged with which way is up
+  (EXIF Orientation, as phones and cameras write it) open upright, in the
+  window and in the folder browser's thumbnails
 - **Save Options (File menu):** JPEG, PNG and WebP tabs, each showing the
   estimated size of the open image. JPEG and WebP: quality (default 100);
   WebP also Lossless. PNG: full colour or 256 colours. PNG and WebP: keep
