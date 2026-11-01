@@ -1070,7 +1070,9 @@ static Bitmap* MakeBitmapFromPixels(const DecodedImage& img)
 // Decodes the formats Windows Imaging Component handles (PNG, JPEG, BMP,
 // GIF, TIFF, ...); first frame only, like Bitmap::FromFile. COM must be
 // initialised on the calling thread.
-static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out)
+// pHr receives the failure, e.g. WINCODEC_ERR_COMPONENTNOTFOUND when Windows
+// has no decoder for the format (HEIC/AVIF without their Store extensions).
+static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr = nullptr)
 {
     IWICImagingFactory*    fac   = nullptr;
     IWICBitmapDecoder*     dec   = nullptr;
@@ -1097,7 +1099,51 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out)
     if (frame) frame->Release();
     if (dec)   dec->Release();
     if (fac)   fac->Release();
+    if (pHr) *pHr = hr;
     return SUCCEEDED(hr);
+}
+
+static Bitmap* LoadBitmapViaWic(const wchar_t* path)
+{
+    DecodedImage img;
+    return DecodeWicPixels(path, img) ? MakeBitmapFromPixels(img) : nullptr;
+}
+
+// HEIC/HEIF and AVIF open only through codecs Windows installs from the Store
+static bool IsStoreCodecPath(const wchar_t* path)
+{
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return false;
+    for (auto e : { L"heic", L"heif", L"hif", L"avif" }) if (_wcsicmp(dot + 1, e) == 0) return true;
+    return false;
+}
+
+// Explains a HEIC/AVIF that wouldn't open and offers the free Store extension
+static void ShowStoreCodecHelp(const wchar_t* path, HRESULT hr)
+{
+    const wchar_t* dot = wcsrchr(path, L'.');
+    bool avif = dot && _wcsicmp(dot + 1, L"avif") == 0;
+    std::wstring msg = PathFindFileNameW(path);
+    const wchar_t* storeUrl;
+    if (avif) {
+        msg += L"\n\nOpening AVIF images needs Microsoft's free \"AV1 Video Extension\" "
+               L"from the Microsoft Store.";
+        storeUrl = L"ms-windows-store://pdp/?ProductId=9MVZQVXJBQ9V";
+    } else if (hr == WINCODEC_ERR_COMPONENTNOTFOUND || hr == WINCODEC_ERR_COMPONENTINITIALIZEFAILURE) {
+        // Windows 10's own HEIF reader fails to start without the extension
+        msg += L"\n\nOpening HEIC images (the photo format of iPhones and many other phones) "
+               L"needs Microsoft's free \"HEIF Image Extensions\" from the Microsoft Store. "
+               L"Most phone photos also need \"HEVC Video Extensions\".";
+        storeUrl = L"ms-windows-store://pdp/?ProductId=9PMMSR1CGPWG";
+    } else {
+        msg += L"\n\nWindows found a HEIF decoder but couldn't read this image. Most phone "
+               L"photos also need Microsoft's \"HEVC Video Extensions\" from the Microsoft Store.";
+        storeUrl = L"ms-windows-store://pdp/?ProductId=9NMZLZ57R3T7";
+    }
+    msg += L"\n\nOpen the Microsoft Store page now?";
+    if (MessageBox(g_hwndMain, msg.c_str(), APP_TITLE, MB_YESNO | MB_ICONINFORMATION) == IDYES &&
+        (INT_PTR)ShellExecuteW(g_hwndMain, NULL, storeUrl, NULL, NULL, SW_SHOWNORMAL) <= 32)
+        MessageBox(g_hwndMain, L"The Microsoft Store couldn't be opened on this PC.", APP_TITLE, MB_ICONWARNING);
 }
 
 // ─── WebP helpers ────────────────────────────────────────────────────────────
@@ -1570,6 +1616,14 @@ static void LoadImageFromPath(const wchar_t* file)
         HRESULT hrWebP = S_OK;
         const wchar_t* webpStep = nullptr;
         bmp = isWebP ? LoadWebP(file, &hrWebP, &webpStep) : Bitmap::FromFile(file);
+        if (!isWebP && (!bmp || bmp->GetLastStatus() != Ok)) {
+            // GDI+ can't read HEIC, AVIF and some others; Windows' WIC codecs can
+            delete bmp;
+            DecodedImage img;
+            HRESULT hrWic = S_OK;
+            bmp = DecodeWicPixels(file, img, &hrWic) ? MakeBitmapFromPixels(img) : nullptr;
+            if (!bmp && IsStoreCodecPath(file)) { ShowStoreCodecHelp(file, hrWic); return; }
+        }
         if (!bmp || (!isWebP && bmp->GetLastStatus() != Ok)) {
             wchar_t msg[512];
             if (isWebP)
@@ -1671,6 +1725,7 @@ struct AsyncImageLoad {
     std::wstring path;
     bool fromStrip = false;   // opened from the folder browser
     bool ok = false;
+    HRESULT hr = S_OK;        // WIC failure, to explain missing HEIC/AVIF codecs
     DecodedImage img;
 };
 static bool         g_loadThreadBusy = false;
@@ -1701,7 +1756,7 @@ static void StartLoadThread(const std::wstring& path, bool fromStrip)
             else if (dot && _wcsicmp(dot + 1, L"webp") == 0)
                 req->ok = DecodeWebPPixels(p, req->img);
             else
-                req->ok = DecodeWicPixels(p, req->img);
+                req->ok = DecodeWicPixels(p, req->img, &req->hr);
         } catch (const std::bad_alloc&) {
             // An uncaught exception here would terminate the app
             req->ok = false;
@@ -1752,6 +1807,8 @@ static void FinishImageLoad(AsyncImageLoad* r)
     std::vector<BYTE>().swap(req->img.px);
     if (bmp)
         InstallCanvasImage(bmp, req->path.c_str(), IsSvgPath(req->path.c_str()), true, req->img.scale, req->fromStrip);
+    else if (IsStoreCodecPath(req->path.c_str()))
+        ShowStoreCodecHelp(req->path.c_str(), req->hr);   // GDI+ can't read these either
     else
         LoadImageFromPath(req->path.c_str());   // GDI+ fallback; reports the error if this fails too
     UpdateTitleBar();   // back to the open file's name if the load failed
@@ -1761,12 +1818,10 @@ static void FinishImageLoad(AsyncImageLoad* r)
         if (g_zoomFitMode) ZoomToFit();
         else               ZoomToCover();
         if (g_currentTool != TOOL_HAND) SetTool(TOOL_HAND);
-    } else {
-        // Load failed: move the highlight back to the file still open
-        for (int i = 0; i < (int)g_folderEntries.size(); i++)
-            if (_wcsicmp(g_folderEntries[i].path.c_str(), g_currentFile) == 0)
-                g_folderCurrentIdx = i;
     }
+    // On failure the highlight stays on the file that wouldn't open (the
+    // canvas keeps the previous image), so the arrow keys carry on past it
+    // rather than retrying it every time.
     CenterFolderBrowserOnCurrent();
     if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
 }
@@ -1786,7 +1841,7 @@ static void DoOpen()
     OPENFILENAME ofn = {};
     ofn.lStructSize    = sizeof(ofn);
     ofn.hwndOwner      = g_hwndMain;
-    ofn.lpstrFilter    = L"Image Files\0*.png;*.bmp;*.jpg;*.jpeg;*.gif;*.tif;*.tiff;*.webp;*.svg\0All Files\0*.*\0";
+    ofn.lpstrFilter    = L"Image Files\0*.png;*.bmp;*.jpg;*.jpeg;*.gif;*.tif;*.tiff;*.webp;*.svg;*.heic;*.heif;*.hif;*.avif\0All Files\0*.*\0";
     ofn.lpstrFile      = file;
     ofn.nMaxFile       = MAX_PATH;
     ofn.lpstrInitialDir = initDir[0] ? initDir : nullptr;
@@ -2144,16 +2199,19 @@ static void DoSaveAs()
     ofn.lpstrInitialDir = initDir[0] ? initDir : nullptr;
     ofn.lStructSize  = sizeof(ofn);
     ofn.hwndOwner    = g_hwndMain;
-    ofn.lpstrFilter  = L"PNG Image\0*.png\0BMP Image\0*.bmp\0JPEG Image\0*.jpg;*.jpeg\0WebP Image\0*.webp\0All Files\0*.*\0";
+    ofn.lpstrFilter  = L"PNG Image\0*.png\0JPEG Image\0*.jpg;*.jpeg\0WebP Image\0*.webp\0"
+                       L"GIF Image\0*.gif\0TIFF Image\0*.tif;*.tiff\0BMP Image\0*.bmp\0All Files\0*.*\0";
     // Default filter/extension to match the currently open file type
     const wchar_t* curDot = wcsrchr(g_currentFile, L'.');
     DWORD filterIndex = 1;
     const wchar_t* defExt = L"png";
     if (curDot) {
-        if      (_wcsicmp(curDot + 1, L"bmp")  == 0)                          { filterIndex = 2; defExt = L"bmp"; }
-        else if (_wcsicmp(curDot + 1, L"jpg")  == 0 ||
-                 _wcsicmp(curDot + 1, L"jpeg") == 0)                          { filterIndex = 3; defExt = L"jpg"; }
-        else if (_wcsicmp(curDot + 1, L"webp") == 0)                          { filterIndex = 4; defExt = L"webp"; }
+        const wchar_t* e = curDot + 1;
+        if      (_wcsicmp(e, L"jpg") == 0 || _wcsicmp(e, L"jpeg") == 0) { filterIndex = 2; defExt = L"jpg"; }
+        else if (_wcsicmp(e, L"webp") == 0)                             { filterIndex = 3; defExt = L"webp"; }
+        else if (_wcsicmp(e, L"gif") == 0)                              { filterIndex = 4; defExt = L"gif"; }
+        else if (_wcsicmp(e, L"tif") == 0 || _wcsicmp(e, L"tiff") == 0) { filterIndex = 5; defExt = L"tif"; }
+        else if (_wcsicmp(e, L"bmp") == 0)                              { filterIndex = 6; defExt = L"bmp"; }
     }
     ofn.nFilterIndex = filterIndex;
     ofn.lpstrFile    = file;
@@ -2892,7 +2950,8 @@ static bool IsImageExtension(const wchar_t* ext)
 {
     static const wchar_t* k[] = {
         L"png", L"jpg", L"jpeg", L"bmp", L"gif",
-        L"tif", L"tiff", L"webp", L"svg"
+        L"tif", L"tiff", L"webp", L"svg",
+        L"heic", L"heif", L"hif", L"avif"   // need Windows' Store codecs
     };
     for (auto e : k) if (_wcsicmp(ext, e) == 0) return true;
     return false;
@@ -3096,6 +3155,7 @@ static Bitmap* MakeFolderThumb(const wchar_t* path)
     } else {
         src = Bitmap::FromFile(path);
         if (src && src->GetLastStatus() != Ok) { delete src; src = nullptr; }
+        if (!src) src = LoadBitmapViaWic(path);   // HEIC, AVIF and others GDI+ can't read
     }
     if (!src) return nullptr;
 
@@ -7008,6 +7068,12 @@ L"                    at 100% (SVGs still scale up, as they stay sharp)\r\n"
 L"\r\n"
 L"FILES\r\n"
 L"-----\r\n"
+L"Formats             Opens PNG, JPEG, WebP, GIF, TIFF, BMP and SVG.\r\n"
+L"                    HEIC/HEIF (phone photos) and AVIF open when\r\n"
+L"                    Windows has Microsoft's free Store extensions:\r\n"
+L"                    HEIF Image Extensions (and HEVC Video Extensions\r\n"
+L"                    for most phone photos), or AV1 Video Extension.\r\n"
+L"                    Saves PNG, JPEG, WebP, GIF, TIFF and BMP.\r\n"
 L"Drag and drop       Drop an image file onto the window to open it\r\n"
 L"File > Open Recent  The last 10 images opened or saved\r\n"
 L"File > Delete       Send the open image to the Recycle Bin and\r\n"
@@ -11979,6 +12045,7 @@ static Bitmap* LoadBitmapForCopy(const wchar_t* path)
     if (dot && _wcsicmp(dot + 1, L"webp") == 0) return LoadWebP(path);
     Bitmap* bmp = Bitmap::FromFile(path);
     if (bmp && bmp->GetLastStatus() != Ok) { delete bmp; bmp = nullptr; }
+    if (!bmp) bmp = LoadBitmapViaWic(path);   // HEIC, AVIF and others GDI+ can't read
     return bmp;
 }
 
@@ -12494,7 +12561,9 @@ static LRESULT CALLBACK FolderBrowserWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             if (wParam == VK_LEFT)  NavigateToFile(cur < 0 ? n - 1 : (cur + n - 1) % n);
             if (wParam == VK_RIGHT) NavigateToFile(cur < 0 ? 0 : (cur + 1) % n);
         }
-        if (wParam == VK_DELETE) DoDeleteFile();
+        // Delete acts on the highlighted file, which can differ from the open
+        // one when a file wouldn't open
+        if (wParam == VK_DELETE && cur >= 0 && cur < n) DeleteFolderFile(g_folderEntries[cur].path);
         if (wParam == VK_F2) {
             RECT rc; GetClientRect(hwnd, &rc);
             BeginFolderRename(hwnd, g_folderCurrentIdx, FolderCellLeft(g_folderCurrentIdx, rc.right));
@@ -14490,7 +14559,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         DragFinish(drop);
         if (!found) {
-            MessageBox(hwnd, L"MyPaint can open PNG, JPEG, BMP, GIF, TIFF, WebP and SVG images.",
+            MessageBox(hwnd, L"MyPaint can open PNG, JPEG, BMP, GIF, TIFF, WebP, SVG, HEIC and AVIF images.",
                        APP_TITLE, MB_ICONINFORMATION);
             return 0;
         }

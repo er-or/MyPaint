@@ -22,6 +22,10 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Dark and light themes**
 - **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP (including the first
   frame of animated WebP) and SVG; saves PNG, JPEG, BMP, GIF, TIFF and WebP.
+  HEIC/HEIF (phone photos) and AVIF also open, using Windows' own decoders
+  from Microsoft's free Store extensions (HEIF Image Extensions, plus HEVC
+  Video Extensions for most phone photos; AV1 Video Extension for AVIF).
+  Without them, MyPaint explains what to install.
   An SVG is never overwritten: Save on one opens Save As with a PNG name.
 - **Save Options (File menu):** JPEG, PNG and WebP tabs, each showing the
   estimated size of the open image. JPEG and WebP: quality (default 100);
