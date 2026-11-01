@@ -267,7 +267,7 @@ static HICON g_hIcoStatusCrop   = NULL;  // canvas size pane
 static HBITMAP g_hbmFileMenuIcons[8]  = {};
 static HBITMAP g_hbmEditMenuIcons[6]  = {};  // Undo, Redo, Cut, Copy, Paste, SelectAll
 static HBITMAP g_hbmImageMenuIcons[6] = {};  // RotateRight, RotateLeft, FlipH, FlipV, Crop, Resize
-static HBITMAP g_hbmViewMenuIcons[9] = {};   // one per kViewMenuEntries item
+static HBITMAP g_hbmViewMenuIcons[10] = {};  // one per kViewMenuEntries item
 
 // Pre-rendered opaque bitmaps for status bar icons — used in WM_DRAWITEM via BitBlt
 // so the icon draw is a single atomic GDI operation and never flickers.
@@ -443,11 +443,16 @@ static HWND  g_hwndFolderBrowser   = NULL;
 static HWND  g_hwndFocusBeforeDeactivate = NULL;   // child to refocus on reactivation
 
 // stale: thumb was made for another strip height and is redone when visible
-struct FolderEntry { std::wstring path; Bitmap* thumb = nullptr; bool failed = false; FILETIME modified = {}; bool stale = false; };
+// taken: EXIF date taken (local time), read only when sorting by it
+struct FolderEntry { std::wstring path; Bitmap* thumb = nullptr; bool failed = false; FILETIME modified = {}; bool stale = false;
+                     ULONGLONG size = 0; FILETIME taken = {}; bool takenRead = false; };
 static std::vector<FolderEntry> g_folderEntries;
 static std::vector<FolderEntry> g_folderHiddenEntries;   // left out by the search; kept for their thumbnails
 static int   g_folderCurrentIdx   = -1;
 static std::wstring g_folderFilter;     // search text: only file names containing it are listed
+enum { SORT_NAME, SORT_TAKEN, SORT_MODIFIED, SORT_SIZE, SORT_TYPE };
+static int   g_folderSort     = SORT_NAME;   // folder browser order; ID_SORT_NAME + this
+static bool  g_folderSortDesc = false;
 static int   g_folderTotalCount   = 0;  // images in the folder, before the search filter
 static bool  g_folderSearchOpen   = false;
 static HWND  g_hwndFolderSearch     = NULL;   // search panel at the left end of the strip
@@ -2422,6 +2427,8 @@ static void LoadSettings()
     if (qv(L"DarkMode", &val)) g_darkMode = (val != 0);
     if (qv(L"FolderBrowserFromFile", &val))  g_folderBrowserFromFile  = (val != 0);
     if (qv(L"FolderBrowserFromBlank", &val)) g_folderBrowserFromBlank = (val != 0);
+    if (qv(L"FolderSort", &val) && val <= SORT_TYPE) g_folderSort = (int)val;
+    if (qv(L"FolderSortDesc", &val)) g_folderSortDesc = (val != 0);
     if (qv(L"SlideshowSeconds", &val) && (val == 3 || val == 5 || val == 10)) g_slideSeconds = (int)val;
     if (qv(L"FolderBrowserH", &val) && val <= 4000)
         g_folderBrowserH = max(FOLDER_BROWSER_MIN_H, (int)val);
@@ -2519,6 +2526,8 @@ static void SaveSettings()
     RegDeleteValueW(hKey, L"FolderBrowser");   // replaced by the two values above
     sv(L"FolderBrowserH", (DWORD)g_folderBrowserH);
     sv(L"SlideshowSeconds", (DWORD)g_slideSeconds);
+    sv(L"FolderSort",       (DWORD)g_folderSort);
+    sv(L"FolderSortDesc",   (DWORD)(g_folderSortDesc ? 1 : 0));
     sv(L"JpegQuality",    (DWORD)g_jpegQuality);
     sv(L"WebpQuality",    (DWORD)g_webpQuality);
     sv(L"WebpLossless",   (DWORD)(g_webpLossless ? 1 : 0));
@@ -3076,6 +3085,79 @@ static void FreeFolderThumbs()
     g_folderScrollX = 0;
 }
 
+// EXIF date taken of a JPEG or TIFF, as local time; false when it has none
+static bool ReadDateTaken(const wchar_t* path, FILETIME& ft)
+{
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot || !UsesExifOrientation(path)) return false;   // the formats with EXIF dates
+    bool tiff = _wcsicmp(dot + 1, L"tif") == 0 || _wcsicmp(dot + 1, L"tiff") == 0;
+    static IWICImagingFactory* fac = nullptr;   // UI thread only
+    if (!fac && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))))
+        return false;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICMetadataQueryReader* qr = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(fac->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(frame->GetMetadataQueryReader(&qr))) {
+        // Date taken, else date digitised, else the date the file was written by the camera
+        static const wchar_t* jpegQ[] = { L"/app1/ifd/exif/{ushort=36867}", L"/app1/ifd/exif/{ushort=36868}", L"/app1/ifd/{ushort=306}" };
+        static const wchar_t* tiffQ[] = { L"/ifd/exif/{ushort=36867}", L"/ifd/exif/{ushort=36868}", L"/ifd/{ushort=306}" };
+        for (auto q : tiff ? tiffQ : jpegQ) {
+            PROPVARIANT v; PropVariantInit(&v);
+            SYSTEMTIME st = {};
+            if (SUCCEEDED(qr->GetMetadataByName(q, &v)) && v.vt == VT_LPSTR && v.pszVal &&
+                sscanf_s(v.pszVal, "%hu:%hu:%hu %hu:%hu:%hu", &st.wYear, &st.wMonth, &st.wDay,
+                         &st.wHour, &st.wMinute, &st.wSecond) == 6 &&
+                st.wYear > 1900 && SystemTimeToFileTime(&st, &ft))
+                ok = true;
+            PropVariantClear(&v);
+            if (ok) break;
+        }
+    }
+    if (qr) qr->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    return ok;
+}
+
+// Orders g_folderEntries by g_folderSort / g_folderSortDesc, then by name
+static void SortFolderEntries()
+{
+    if (g_folderSort == SORT_TAKEN) {
+        bool slow = false;
+        for (auto& e : g_folderEntries) {
+            if (e.takenRead) continue;
+            if (!slow) { slow = true; SetCursor(LoadCursor(NULL, IDC_WAIT)); }
+            // Photos without a date sort by when the file was last changed
+            if (!ReadDateTaken(e.path.c_str(), e.taken)) FileTimeToLocalFileTime(&e.modified, &e.taken);
+            e.takenRead = true;
+        }
+    }
+    auto byName = [](const FolderEntry& a, const FolderEntry& b) {
+        // As Explorer does: "photo 2" before "photo 10"
+        return StrCmpLogicalW(PathFindFileNameW(a.path.c_str()), PathFindFileNameW(b.path.c_str())) < 0;
+    };
+    auto key = [](const FolderEntry& a, const FolderEntry& b) -> int {
+        switch (g_folderSort) {
+        case SORT_TAKEN:    return CompareFileTime(&a.taken, &b.taken);
+        case SORT_MODIFIED: return CompareFileTime(&a.modified, &b.modified);
+        case SORT_SIZE:     return a.size < b.size ? -1 : a.size > b.size ? 1 : 0;
+        case SORT_TYPE: {
+            const wchar_t* ea = PathFindExtensionW(a.path.c_str());
+            const wchar_t* eb = PathFindExtensionW(b.path.c_str());
+            return _wcsicmp(ea, eb);
+        }
+        }
+        return StrCmpLogicalW(PathFindFileNameW(a.path.c_str()), PathFindFileNameW(b.path.c_str()));
+    };
+    std::sort(g_folderEntries.begin(), g_folderEntries.end(), [&](const FolderEntry& a, const FolderEntry& b) {
+        int c = key(a, b);
+        if (c != 0) return g_folderSortDesc ? c > 0 : c < 0;
+        return byName(a, b);   // ties: by name, A to Z
+    });
+}
+
 static void BuildFolderList()
 {
     // Keep the old entries so thumbnails can be reused below: this runs on
@@ -3110,6 +3192,7 @@ static void BuildFolderList()
             StringCchCopy(full, MAX_PATH, dir);
             PathAppendW(full, fd.cFileName);
             g_folderEntries.push_back({ full, nullptr, false, fd.ftLastWriteTime });
+            g_folderEntries.back().size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
@@ -3129,9 +3212,13 @@ static void BuildFolderList()
             e.thumb  = it->thumb;  it->thumb = nullptr;
             e.failed = it->failed;
             e.stale  = it->stale;
+            e.taken  = it->taken;
+            e.takenRead = it->takenRead;
         }
     }
     for (auto& e : old) delete e.thumb;
+
+    SortFolderEntries();
 
     // The search keeps only names containing its text; the rest are set aside
     // with their thumbnails, so they are back at once when the text changes
@@ -3345,11 +3432,16 @@ static void DoDeleteFile()
                    APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
 
+    // The deleted file's place in the list (in its current order) is where
+    // the next one sits once it is gone
+    BuildFolderList();
+    int idx = -1;
+    for (int i = 0; i < (int)g_folderEntries.size(); i++)
+        if (_wcsicmp(g_folderEntries[i].path.c_str(), g_currentFile) == 0) { idx = i; break; }
+
     if (!RecycleFile(g_currentFile)) return;
     g_modified = false;
 
-    // The deleted file's place in the rescanned list is where the next one sits
-    std::wstring deleted = g_currentFile;
     BuildFolderList();
     int n = (int)g_folderEntries.size();
     if (n == 0 && !g_folderFilter.empty() && g_folderTotalCount > 0) {
@@ -3364,9 +3456,7 @@ static void DoDeleteFile()
         if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
         return;
     }
-    int idx = 0;
-    while (idx < n && _wcsicmp(g_folderEntries[idx].path.c_str(), deleted.c_str()) < 0) idx++;
-    if (idx == n) idx = 0;
+    if (idx < 0 || idx >= n) idx = 0;
     g_folderCurrentIdx = idx;
     CenterFolderBrowserOnCurrent();
     if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
@@ -4681,6 +4771,7 @@ static const ImageMenuEntry kViewMenuEntries[] = {
     { ID_ZOOM_FIT_WINDOW,    L"Fi&t to Window\tCtrl+0",   kPageFitD,           20.0f },
     { ID_ZOOM_ACTUAL,        L"&Actual Size\tCtrl+1",     nullptr,             16.0f },
     { ID_FOLDER_BROWSER_BTN, L"Folder &Browser",          kFolderBrowserIconD, 20.0f },
+    { 0,                     L"Folder Browser &Sort",     nullptr,             16.0f },   // the submenu
     { ID_VIEW_DARKMODE,      L"&Dark Mode\tCtrl+Shift+D", kMoonD,              24.0f },
 };
 static const ImageMenuEntry kViewMenuLightMode =
@@ -4732,6 +4823,14 @@ static void SetViewMenuIcons()
                 g.DrawPath(&pen, &r);
                 PointF tri[3] = { {6.5f, 5.5f}, {10.5f, 8.f}, {6.5f, 10.5f} };
                 g.FillPolygon(&br, tri, 3);
+            } else if (e.cmdId == 0) {
+                // Sort: lines getting shorter, and a down arrow
+                g.DrawLine(&pen, 2.f, 4.f, 9.5f, 4.f);
+                g.DrawLine(&pen, 2.f, 8.f, 7.5f, 8.f);
+                g.DrawLine(&pen, 2.f, 12.f, 5.5f, 12.f);
+                g.DrawLine(&pen, 12.5f, 3.f, 12.5f, 13.f);
+                PointF head[3] = { {10.f, 10.5f}, {12.5f, 13.f}, {15.f, 10.5f} };
+                g.DrawLines(&pen, head, 3);
             } else if (e.cmdId == ID_ZOOM_ACTUAL) {
                 // "1:1"
                 g.DrawLine(&pen, 4.f, 4.f, 4.f, 12.5f);   g.DrawLine(&pen, 2.5f, 5.5f, 4.f, 4.f);
@@ -4757,7 +4856,9 @@ static void SetViewMenuIcons()
         mii.fType      = MFT_STRING;
         mii.dwTypeData = const_cast<LPWSTR>(e.text);
         mii.hbmpItem   = hbm;
-        SetMenuItemInfoW(hView, e.cmdId, FALSE, &mii);
+        if (e.cmdId) { SetMenuItemInfoW(hView, e.cmdId, FALSE, &mii); continue; }
+        for (int pos = 0, n = GetMenuItemCount(hView); pos < n; pos++)   // the submenu has no ID
+            if (GetSubMenu(hView, pos)) { SetMenuItemInfoW(hView, pos, TRUE, &mii); break; }
     }
 }
 
@@ -7395,6 +7496,12 @@ L"  Show in Explorer      Open the folder with the file selected\r\n"
 L"  Open in Inkscape      SVG files, when Inkscape is installed\r\n"
 L"  Rename / Delete       As F2 / Delete, for any thumbnail\r\n"
 L"  Properties            The Windows file Properties dialog\r\n"
+L"  Sort by               Name, date taken (from the photo; else date\r\n"
+L"                        modified), date modified, size or type,\r\n"
+L"                        ascending or descending. Also by right-\r\n"
+L"                        clicking empty space in the strip, or in\r\n"
+L"                        View > Folder Browser Sort. Remembered; the\r\n"
+L"                        arrow keys and slideshow follow this order.\r\n"
 L"Menu key, Shift+F10 Menu for the open image\r\n"
 L"Drag the top edge   Resize the strip, from 40 px up to half the\r\n"
 L"                    screen; thumbnails grow with it\r\n"
@@ -12433,6 +12540,37 @@ static void BeginFolderRename(HWND strip, int idx, int cx)
     SetFocus(g_hwndFolderRename);
 }
 
+// Fills a Sort by menu (strip menus, View > Folder Browser Sort) with the
+// choices, the current ones marked
+static void FillFolderSortMenu(HMENU m)
+{
+    while (GetMenuItemCount(m) > 0) DeleteMenu(m, 0, MF_BYPOSITION);
+    AppendMenuW(m, MF_STRING, ID_SORT_NAME,     L"&Name");
+    AppendMenuW(m, MF_STRING, ID_SORT_TAKEN,    L"Date &taken");
+    AppendMenuW(m, MF_STRING, ID_SORT_MODIFIED, L"Date &modified");
+    AppendMenuW(m, MF_STRING, ID_SORT_SIZE,     L"&Size");
+    AppendMenuW(m, MF_STRING, ID_SORT_TYPE,     L"T&ype");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_SORT_ASC,      L"&Ascending");
+    AppendMenuW(m, MF_STRING, ID_SORT_DESC,     L"&Descending");
+    CheckMenuRadioItem(m, ID_SORT_NAME, ID_SORT_TYPE, ID_SORT_NAME + g_folderSort, MF_BYCOMMAND);
+    CheckMenuRadioItem(m, ID_SORT_ASC, ID_SORT_DESC, g_folderSortDesc ? ID_SORT_DESC : ID_SORT_ASC, MF_BYCOMMAND);
+}
+
+// Applies a Sort by menu choice (ID_SORT_*)
+static void SetFolderSort(UINT cmd)
+{
+    if (cmd >= ID_SORT_NAME && cmd <= ID_SORT_TYPE) g_folderSort = (int)(cmd - ID_SORT_NAME);
+    else if (cmd == ID_SORT_ASC || cmd == ID_SORT_DESC) g_folderSortDesc = (cmd == ID_SORT_DESC);
+    else return;
+    if (!g_showFolderBrowser && !g_hwndFullscreen) return;   // used the next time the list is built
+    HCURSOR old = GetCursor();
+    BuildFolderList();
+    SetCursor(old);
+    if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
+    if (g_hwndFullscreen) InvalidateRect(g_hwndFullscreen, NULL, FALSE);   // its "3 / 14"
+}
+
 enum { FCM_INKSCAPE = 100 };   // SVG only, added when Inkscape is installed
 enum { FCM_ROTATE_RIGHT = 1, FCM_ROTATE_LEFT, FCM_COPY_IMAGE, FCM_COPY_PATH, FCM_SHOW, FCM_RENAME, FCM_DELETE, FCM_PROPERTIES };
 
@@ -12463,6 +12601,8 @@ static void ShowFolderItemMenu(HWND strip, int idx, int cx, POINT screenPt, UINT
         { FCM_PROPERTIES,   L"Pr&operties",       kPropertiesD,     24.0f },
     };
     HMENU hm = CreatePopupMenu();
+    HMENU hSort = CreatePopupMenu();   // destroyed with hm
+    FillFolderSortMenu(hSort);
     std::vector<HBITMAP> icons;
     for (auto& it : kItems) {
         if (!it.id) { AppendMenuW(hm, MF_SEPARATOR, 0, NULL); continue; }
@@ -12496,6 +12636,8 @@ static void ShowFolderItemMenu(HWND strip, int idx, int cx, POINT screenPt, UINT
         EnableMenuItem(hm, FCM_ROTATE_RIGHT, MF_BYCOMMAND | MF_GRAYED);
         EnableMenuItem(hm, FCM_ROTATE_LEFT,  MF_BYCOMMAND | MF_GRAYED);
     }
+    AppendMenuW(hm, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hm, MF_POPUP, (UINT_PTR)hSort, L"Sort &by");
 
     int cmd = (int)TrackPopupMenu(hm, align | TPM_TOPALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                   screenPt.x, screenPt.y, 0, g_hwndMain, NULL);
@@ -12516,6 +12658,7 @@ static void ShowFolderItemMenu(HWND strip, int idx, int cx, POINT screenPt, UINT
     case FCM_RENAME:     BeginFolderRename(strip, idx, cx); break;
     case FCM_DELETE:     DeleteFolderFile(path); break;
     case FCM_PROPERTIES: SHObjectProperties(g_hwndMain, SHOP_FILEPATH, path.c_str(), NULL); break;
+    default:             SetFolderSort((UINT)cmd); break;
     }
 }
 
@@ -12751,6 +12894,15 @@ static LRESULT CALLBACK FolderBrowserWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             POINT cp = sp; ScreenToClient(hwnd, &cp);
             idx = FolderCellAt(cp.x, rc.right, &cx);
             if (idx >= 0) ShowFolderItemMenu(hwnd, idx, cx, sp, TPM_LEFTALIGN);
+            else {
+                // Empty space or the wrap gap: just the sort order, as in Explorer
+                HMENU hm = CreatePopupMenu();
+                FillFolderSortMenu(hm);
+                UINT cmd = (UINT)TrackPopupMenu(hm, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                                sp.x, sp.y, 0, g_hwndMain, NULL);
+                DestroyMenu(hm);
+                SetFolderSort(cmd);
+            }
         }
         return 0;
     }
@@ -15526,6 +15678,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_VIEW_SLIDESHOW:
             EnterFullscreen(true);
             break;
+        case ID_SORT_NAME: case ID_SORT_TAKEN: case ID_SORT_MODIFIED: case ID_SORT_SIZE: case ID_SORT_TYPE:
+        case ID_SORT_ASC:  case ID_SORT_DESC:
+            SetFolderSort(LOWORD(wParam));
+            break;
         case ID_ZOOM_FIT_WINDOW:
             ZoomToFit();
             break;
@@ -15873,6 +16029,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (subIdx == 3) {
                     HMENU hView = GetSubMenu(g_hMenuMain, 3);
                     CheckMenuItem(hView, ID_FOLDER_BROWSER_BTN, MF_BYCOMMAND | (g_showFolderBrowser ? MF_CHECKED : MF_UNCHECKED));
+                    for (int i = 0, n = GetMenuItemCount(hView); i < n; i++)
+                        if (HMENU sub = GetSubMenu(hView, i)) FillFolderSortMenu(sub);
                 }
                 HMENU hPopup = GetSubMenu(g_hMenuMain, subIdx);
                 RECT rc = {};

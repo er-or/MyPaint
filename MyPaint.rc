@@ -53,6 +53,10 @@ BEGIN
         MENUITEM "&Actual Size\tCtrl+1",    ID_ZOOM_ACTUAL
         MENUITEM SEPARATOR
         MENUITEM "Folder &Browser",         ID_FOLDER_BROWSER_BTN
+        POPUP "Folder Browser &Sort"
+        BEGIN
+            MENUITEM "&Name",               ID_SORT_NAME   // filled in by FillFolderSortMenu
+        END
         MENUITEM "&Dark Mode\tCtrl+Shift+D", ID_VIEW_DARKMODE   // "Light Mode" while dark (SetViewMenuIcons)
     END
 END

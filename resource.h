@@ -46,6 +46,14 @@
 #define ID_VIEW_DARKMODE        40601
 #define ID_VIEW_FULLSCREEN      40602   // F11
 #define ID_VIEW_SLIDESHOW       40603   // F5
+// Folder browser sort order (View > Folder Browser Sort, strip menu > Sort by)
+#define ID_SORT_NAME            40610
+#define ID_SORT_TAKEN           40611
+#define ID_SORT_MODIFIED        40612
+#define ID_SORT_SIZE            40613
+#define ID_SORT_TYPE            40614
+#define ID_SORT_ASC             40615
+#define ID_SORT_DESC            40616
 
 // Toolbar menu-bar replacement button IDs
 #define ID_MENU_FILE            40801

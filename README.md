@@ -80,6 +80,12 @@ The thumbnail menu has:
 - **Open in Inkscape**: for SVG files, when Inkscape is installed
 - **Rename / Delete**: as F2 / Delete, but for any thumbnail
 - **Properties**: the standard Windows file Properties dialog
+- **Sort by**: name (with numbers in order, as in Explorer: "photo 2" before
+  "photo 10"), date taken (the photo's own date, else date modified), date
+  modified, size or type, ascending or descending. Also available by
+  right-clicking empty space in the strip, and from View → Folder Browser
+  Sort. MyPaint remembers the choice, and the arrow keys, Delete and the
+  slideshow follow it.
 
 A darker gap in the strip marks where the list wraps from the last file to the
 first. While the strip is open the Hand tool is selected, so dragging the canvas
