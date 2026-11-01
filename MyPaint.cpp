@@ -164,6 +164,7 @@ static const int FOLDER_BROWSER_H     = 140;  // default folder browser height
 static const int FOLDER_BROWSER_MIN_H = 40;   // drag limits: this (room for a preview), and half the screen
 static const int FOLDER_LABEL_H       = 16;   // file name line under each thumbnail
 static const int FOLDER_GRIP_H        = 5;    // top edge band that resizes the strip
+static const int FOLDER_SEARCH_W      = 200;  // search panel at the left end of the strip (Ctrl+F)
 static int g_folderBrowserH = FOLDER_BROWSER_H;  // chosen by dragging the strip's top edge
 static int g_folderCellW    = 112;  // cell width; follows the strip height
 static int g_folderThumbMax = 100;  // size thumbnails are made at; follows the strip height
@@ -442,7 +443,13 @@ static HWND  g_hwndFocusBeforeDeactivate = NULL;   // child to refocus on reacti
 // stale: thumb was made for another strip height and is redone when visible
 struct FolderEntry { std::wstring path; Bitmap* thumb = nullptr; bool failed = false; FILETIME modified = {}; bool stale = false; };
 static std::vector<FolderEntry> g_folderEntries;
+static std::vector<FolderEntry> g_folderHiddenEntries;   // left out by the search; kept for their thumbnails
 static int   g_folderCurrentIdx   = -1;
+static std::wstring g_folderFilter;     // search text: only file names containing it are listed
+static int   g_folderTotalCount   = 0;  // images in the folder, before the search filter
+static bool  g_folderSearchOpen   = false;
+static HWND  g_hwndFolderSearch     = NULL;   // search panel at the left end of the strip
+static HWND  g_hwndFolderSearchEdit = NULL;
 static int   g_folderScrollX = 0;
 static bool  g_updatingZoomEdit = false;
 
@@ -456,7 +463,9 @@ static int   g_bgAlpha            = 100;  // 0-100 percentage
 
 // ─── Dark mode ────────────────────────────────────────────────
 static bool  g_darkMode           = false;
-static bool  g_restoreFolderBrowser = false;   // folder browser was open at last exit
+static bool  g_startedWithFile = false;         // an image was passed on the command line
+static bool  g_folderBrowserFromFile  = true;   // open the folder browser when started with an image
+static bool  g_folderBrowserFromBlank = false;  // ... and when started without one
 
 // Save settings per format, set in File > Save Options
 static const int DEFAULT_SAVE_QUALITY = 100;
@@ -665,6 +674,9 @@ static void    BuildFolderList();
 static void    FreeFolderThumbs();
 static void    NavigateToFile(int idx);
 static void    ToggleFolderBrowser();
+static void    OpenFolderSearch();
+static void    CloseFolderSearch();
+static LRESULT CALLBACK FolderSearchWndProc(HWND, UINT, WPARAM, LPARAM);
 static void    CenterFolderBrowserOnCurrent();
 static void    LayoutChildren(HWND hwndMain);
 static void    LayoutCanvasAndFolderBrowser(HWND hwndMain);
@@ -2322,7 +2334,8 @@ static void LoadSettings()
     if (qv(L"BgAlpha", &val)) { g_bgAlpha = (int)val; if (g_bgAlpha < 0) g_bgAlpha = 0; if (g_bgAlpha > 100) g_bgAlpha = 100; }
 
     if (qv(L"DarkMode", &val)) g_darkMode = (val != 0);
-    if (qv(L"FolderBrowser", &val)) g_restoreFolderBrowser = (val != 0);
+    if (qv(L"FolderBrowserFromFile", &val))  g_folderBrowserFromFile  = (val != 0);
+    if (qv(L"FolderBrowserFromBlank", &val)) g_folderBrowserFromBlank = (val != 0);
     if (qv(L"FolderBrowserH", &val) && val <= 4000)
         g_folderBrowserH = max(FOLDER_BROWSER_MIN_H, (int)val);
 
@@ -2410,7 +2423,13 @@ static void SaveSettings()
     sv(L"BgAlpha",  (DWORD)g_bgAlpha);
 
     sv(L"DarkMode", (DWORD)(g_darkMode ? 1 : 0));
-    sv(L"FolderBrowser", (DWORD)(g_showFolderBrowser ? 1 : 0));
+    // The folder browser state is remembered separately for starting with an
+    // image and starting blank; this session updates the one it started as
+    if (g_startedWithFile) g_folderBrowserFromFile  = g_showFolderBrowser;
+    else                   g_folderBrowserFromBlank = g_showFolderBrowser;
+    sv(L"FolderBrowserFromFile",  (DWORD)(g_folderBrowserFromFile  ? 1 : 0));
+    sv(L"FolderBrowserFromBlank", (DWORD)(g_folderBrowserFromBlank ? 1 : 0));
+    RegDeleteValueW(hKey, L"FolderBrowser");   // replaced by the two values above
     sv(L"FolderBrowserH", (DWORD)g_folderBrowserH);
     sv(L"JpegQuality",    (DWORD)g_jpegQuality);
     sv(L"WebpQuality",    (DWORD)g_webpQuality);
@@ -2962,7 +2981,9 @@ static bool IsImageExtension(const wchar_t* ext)
 static void FreeFolderThumbs()
 {
     for (auto& e : g_folderEntries) { delete e.thumb; e.thumb = nullptr; }
+    for (auto& e : g_folderHiddenEntries) delete e.thumb;
     g_folderEntries.clear();
+    g_folderHiddenEntries.clear();
     g_folderCurrentIdx   = -1;
     g_folderScrollX = 0;
 }
@@ -2973,6 +2994,8 @@ static void BuildFolderList()
     // every image switch, and the folder usually hasn't changed.
     std::vector<FolderEntry> old;
     old.swap(g_folderEntries);
+    old.insert(old.end(), g_folderHiddenEntries.begin(), g_folderHiddenEntries.end());
+    g_folderHiddenEntries.clear();
     g_folderCurrentIdx   = -1;
     g_folderScrollX = 0;
 
@@ -3007,6 +3030,7 @@ static void BuildFolderList()
         return _wcsicmp(a.path.c_str(), b.path.c_str()) < 0;
     };
     std::sort(g_folderEntries.begin(), g_folderEntries.end(), byPath);
+    std::sort(old.begin(), old.end(), byPath);
 
     // Carry over thumbnails for files that are unchanged since they were made
     // (old is sorted the same way); edited or new files get a fresh one.
@@ -3020,6 +3044,17 @@ static void BuildFolderList()
         }
     }
     for (auto& e : old) delete e.thumb;
+
+    // The search keeps only names containing its text; the rest are set aside
+    // with their thumbnails, so they are back at once when the text changes
+    g_folderTotalCount = (int)g_folderEntries.size();
+    if (!g_folderFilter.empty()) {
+        std::vector<FolderEntry> shown;
+        for (auto& e : g_folderEntries)
+            (StrStrIW(PathFindFileNameW(e.path.c_str()), g_folderFilter.c_str()) ? shown : g_folderHiddenEntries).push_back(e);
+        g_folderEntries.swap(shown);
+    }
+    if (g_folderSearchOpen && g_hwndFolderSearch) InvalidateRect(g_hwndFolderSearch, NULL, FALSE);   // its count
 
     if (g_currentFile[0]) {
         for (int i = 0; i < (int)g_folderEntries.size(); i++) {
@@ -3228,6 +3263,13 @@ static void DoDeleteFile()
     std::wstring deleted = g_currentFile;
     BuildFolderList();
     int n = (int)g_folderEntries.size();
+    if (n == 0 && !g_folderFilter.empty() && g_folderTotalCount > 0) {
+        // That was the last match: show the whole folder again rather than a blank image
+        g_folderFilter.clear();
+        if (g_hwndFolderSearchEdit) SetWindowTextW(g_hwndFolderSearchEdit, L"");
+        BuildFolderList();
+        n = (int)g_folderEntries.size();
+    }
     if (n == 0) {
         DoNew();
         if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
@@ -3350,6 +3392,12 @@ static void ToggleFolderBrowser()
         BuildFolderList();
         SetTool(TOOL_HAND);
     } else {
+        if (g_folderSearchOpen) {
+            g_folderSearchOpen = false;
+            g_folderFilter.clear();
+            SetWindowTextW(g_hwndFolderSearchEdit, L"");
+            ShowWindow(g_hwndFolderSearch, SW_HIDE);
+        }
         FreeFolderThumbs();
         SetTool(g_toolBeforeFolderBrowser);
     }
@@ -4588,6 +4636,8 @@ static void ApplyDarkMode()
     if (g_hwndZoomFit)       InvalidateRect(g_hwndZoomFit,       NULL, TRUE);
     if (g_hwndFolderBrowserBtn)  InvalidateRect(g_hwndFolderBrowserBtn,  NULL, TRUE);
     if (g_hwndFolderBrowser)    InvalidateRect(g_hwndFolderBrowser,    NULL, TRUE);
+    if (g_hwndFolderSearch)     InvalidateRect(g_hwndFolderSearch,     NULL, TRUE);
+    if (g_hwndFolderSearchEdit) InvalidateRect(g_hwndFolderSearchEdit, NULL, TRUE);
     if (g_hwndColorEdit)  InvalidateRect(g_hwndColorEdit,  NULL, TRUE);
     if (g_hwndReset)      InvalidateRect(g_hwndReset,      NULL, TRUE);
     if (g_hwndSzMinus)    InvalidateRect(g_hwndSzMinus,    NULL, TRUE);
@@ -7097,19 +7147,26 @@ L"Saving an SVG       MyPaint saves PNG, JPEG, BMP, GIF, TIFF and WebP.\r\n"
 L"                    Save on an SVG opens Save As with a .png name, so\r\n"
 L"                    the original SVG is never overwritten.\r\n"
 L"\r\n"
-L"FOLDER BROWSER  (hidden until you open it)\r\n"
-L"------------------------------------------\r\n"
+L"FOLDER BROWSER\r\n"
+L"--------------\r\n"
 L"A strip of thumbnails of every image in the open file's folder,\r\n"
 L"along the bottom of the window. Handy for flicking through photos.\r\n"
+L"It opens by default when you start MyPaint with an image (for\r\n"
+L"example by double-clicking one), and stays closed when you start\r\n"
+L"it on its own. Each way remembers your choice separately.\r\n"
 L"\r\n"
 L"Open / close        Rightmost button in the status bar. MyPaint\r\n"
-L"                    remembers whether it was open and its height.\r\n"
+L"                    also remembers the strip's height.\r\n"
 L"Click thumbnail     Open that image (fitted to the window)\r\n"
 L"Left / Right        Previous / next image; wraps around at the ends\r\n"
 L"Home / End          First / last image\r\n"
 L"Scroll wheel        Scroll the strip (when the mouse is over it)\r\n"
 L"Delete              Send the open image to the Recycle Bin\r\n"
 L"F2                  Rename the open image (Enter saves, Esc cancels)\r\n"
+L"Ctrl+F              Search: a box at the left of the strip; only\r\n"
+L"                    images whose names contain the text are shown.\r\n"
+L"                    Enter opens the first match and moves to the\r\n"
+L"                    strip; Esc (or the x) closes the search.\r\n"
 L"Right-click, or the ... button on a thumbnail:\r\n"
 L"  Rotate right / left   Turn the file and save it (JPEGs losslessly\r\n"
 L"                        when their size allows; not SVG, GIF or\r\n"
@@ -12323,8 +12380,10 @@ static LRESULT CALLBACK FolderBrowserWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, g_darkMode ? RGB(140,140,140) : RGB(110,110,110));
             RECT msg2 = rc;
-            DrawText(hdc, L"No images in this directory", -1, &msg2,
-                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            std::wstring empty = L"No images in this directory";
+            if (!g_folderFilter.empty() && g_folderTotalCount > 0)
+                empty = L"No file names contain \"" + g_folderFilter + L"\"";
+            DrawText(hdc, empty.c_str(), -1, &msg2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             BitBlt(hdc0, 0, 0, panelW, panelH, hdcMem, 0, 0, SRCCOPY);
             SelectObject(hdcMem, hbmOld); DeleteObject(hbmMem); DeleteDC(hdcMem);
             EndPaint(hwnd, &ps);
@@ -12566,6 +12625,7 @@ static LRESULT CALLBACK FolderBrowserWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         // Delete acts on the highlighted file, which can differ from the open
         // one when a file wouldn't open
         if (wParam == VK_DELETE && cur >= 0 && cur < n) DeleteFolderFile(g_folderEntries[cur].path);
+        if (wParam == VK_ESCAPE) CloseFolderSearch();
         if (wParam == VK_F2) {
             RECT rc; GetClientRect(hwnd, &rc);
             BeginFolderRename(hwnd, g_folderCurrentIdx, FolderCellLeft(g_folderCurrentIdx, rc.right));
@@ -12603,6 +12663,175 @@ static LRESULT CALLBACK FolderBrowserWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// ─── Folder browser search (Ctrl+F) ──────────────────────────
+// A panel at the left end of the strip with a text box; the strip lists
+// only the images whose file names contain the text.
+
+// Box position in a search panel w × h; the ✕ that closes it sits to its right
+static RECT FolderSearchEditRect(int w, int h)
+{
+    int y = h >= 64 ? 10 : max(2, (h - 22) / 2);
+    return { 8, y, w - 34, y + 22 };
+}
+static RECT FolderSearchCloseRect(int w, int h)
+{
+    RECT e = FolderSearchEditRect(w, h);
+    return { w - 30, e.top, w - 8, e.bottom };
+}
+
+static void OpenFolderSearch()
+{
+    if (!g_showFolderBrowser) ToggleFolderBrowser();
+    if (!g_showFolderBrowser || !g_hwndFolderSearch) return;
+    if (!g_folderSearchOpen) {
+        g_folderSearchOpen = true;
+        LayoutCanvasAndFolderBrowser(g_hwndMain);   // placed before it is shown
+        ShowWindow(g_hwndFolderSearch, SW_SHOW);
+    }
+    SetFocus(g_hwndFolderSearchEdit);
+    SendMessage(g_hwndFolderSearchEdit, EM_SETSEL, 0, -1);
+}
+
+static void CloseFolderSearch()
+{
+    if (!g_folderSearchOpen) return;
+    g_folderSearchOpen = false;   // first: clearing the box below must not filter again
+    g_folderFilter.clear();
+    SetWindowTextW(g_hwndFolderSearchEdit, L"");
+    if (g_hwndFolderBrowser) SetFocus(g_hwndFolderBrowser);   // before its box is hidden
+    ShowWindow(g_hwndFolderSearch, SW_HIDE);
+    LayoutCanvasAndFolderBrowser(g_hwndMain);
+    BuildFolderList();
+    if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
+}
+
+static LRESULT CALLBACK FolderSearchEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                                     UINT_PTR, DWORD_PTR)
+{
+    switch (msg) {
+    case WM_GETDLGCODE: return DLGC_WANTALLKEYS;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { CloseFolderSearch(); return 0; }
+        // Enter opens the first match (unless a match is already open) and
+        // moves to the strip, where the arrow keys step through the matches
+        if (wParam == VK_RETURN || wParam == VK_DOWN || wParam == VK_TAB) {
+            if (wParam == VK_RETURN && g_folderCurrentIdx < 0 && !g_folderEntries.empty()) NavigateToFile(0);
+            if (g_hwndFolderBrowser) SetFocus(g_hwndFolderBrowser);
+            return 0;
+        }
+        break;
+    case WM_CHAR:
+        if (wParam == VK_RETURN || wParam == VK_ESCAPE || wParam == VK_TAB) return 0;   // no beep
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, FolderSearchEditSubclassProc, 0);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK FolderSearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE:
+        g_hwndFolderSearchEdit = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
+        if (g_hwndFolderSearchEdit) {
+            SendMessage(g_hwndFolderSearchEdit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
+            SendMessage(g_hwndFolderSearchEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search file names");
+            SetWindowSubclass(g_hwndFolderSearchEdit, FolderSearchEditSubclassProc, 0, 0);
+        }
+        return 0;
+
+    case WM_SIZE: {
+        RECT e = FolderSearchEditRect(LOWORD(lParam), HIWORD(lParam));
+        if (g_hwndFolderSearchEdit)
+            SetWindowPos(g_hwndFolderSearchEdit, NULL, e.left, e.top, e.right - e.left, e.bottom - e.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if ((HWND)lParam == g_hwndFolderSearchEdit && HIWORD(wParam) == EN_CHANGE && g_folderSearchOpen) {
+            wchar_t text[MAX_PATH] = {};
+            GetWindowTextW(g_hwndFolderSearchEdit, text, MAX_PATH);
+            g_folderFilter = text;
+            BuildFolderList();
+            if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
+            InvalidateRect(hwnd, NULL, FALSE);   // the match count
+        }
+        return 0;
+
+    case WM_CTLCOLOREDIT:
+        if (g_darkMode) {
+            static HBRUSH hbr = CreateSolidBrush(RGB(45, 45, 45));
+            SetTextColor((HDC)wParam, RGB(230, 230, 230));
+            SetBkColor((HDC)wParam, RGB(45, 45, 45));
+            return (LRESULT)hbr;
+        }
+        break;
+
+    case WM_LBUTTONDOWN: {
+        RECT rc; GetClientRect(hwnd, &rc);
+        RECT x = FolderSearchCloseRect(rc.right, rc.bottom);
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (PtInRect(&x, pt)) CloseFolderSearch();
+        else SetFocus(g_hwndFolderSearchEdit);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        // Same background and top line as the strip, and a line where the strip begins
+        HBRUSH hbBg = CreateSolidBrush(g_darkMode ? RGB(28, 28, 28) : RGB(235, 235, 235));
+        FillRect(hdc, &rc, hbBg);
+        DeleteObject(hbBg);
+        HPEN hSep = CreatePen(PS_SOLID, 1, g_darkMode ? RGB(60,60,60) : RGB(180,180,180));
+        HPEN hOldPen = (HPEN)SelectObject(hdc, hSep);
+        MoveToEx(hdc, 0, 0, nullptr); LineTo(hdc, rc.right, 0);
+        MoveToEx(hdc, rc.right - 1, 0, nullptr); LineTo(hdc, rc.right - 1, rc.bottom);
+        SelectObject(hdc, hOldPen); DeleteObject(hSep);
+
+        COLORREF textClr = g_darkMode ? RGB(170,170,170) : RGB(90,90,90);
+        // ✕ close button
+        RECT x = FolderSearchCloseRect(rc.right, rc.bottom);
+        int cx = (x.left + x.right) / 2, cy = (x.top + x.bottom) / 2;
+        HPEN hX = CreatePen(PS_SOLID, 1, textClr);
+        hOldPen = (HPEN)SelectObject(hdc, hX);
+        MoveToEx(hdc, cx - 4, cy - 4, nullptr); LineTo(hdc, cx + 5, cy + 5);
+        MoveToEx(hdc, cx + 4, cy - 4, nullptr); LineTo(hdc, cx - 5, cy + 5);
+        SelectObject(hdc, hOldPen); DeleteObject(hX);
+
+        // Match count under the box, when the strip is tall enough
+        RECT e = FolderSearchEditRect(rc.right, rc.bottom);
+        RECT t = { e.left, e.bottom + 6, rc.right - 8, e.bottom + 22 };
+        if (t.bottom <= rc.bottom) {
+            wchar_t count[64];
+            int n = (int)g_folderEntries.size();
+            if (g_folderFilter.empty())
+                StringCchPrintfW(count, 64, L"%d image%s", g_folderTotalCount, g_folderTotalCount == 1 ? L"" : L"s");
+            else
+                StringCchPrintfW(count, 64, L"%d of %d image%s", n, g_folderTotalCount, g_folderTotalCount == 1 ? L"" : L"s");
+            HFONT hOldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, textClr);
+            DrawTextW(hdc, count, -1, &t, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(hdc, hOldFont);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
 // ============================================================
 //  Layout
 // ============================================================
@@ -12622,10 +12851,16 @@ static void LayoutCanvasAndFolderBrowser(HWND hwndMain)
     int canvasY = TOOLBAR_HEIGHT + COLORSTRIP_H;
     int canvasH = max(0, H - canvasY - statusH - stripH);
 
-    // Move both in one step so the gap between them never shows
-    HDWP dwp = BeginDeferWindowPos(2);
+    // The search panel, when open, takes the left end of the strip's row
+    int searchW = (showStrip && g_folderSearchOpen && g_hwndFolderSearch) ? min(FOLDER_SEARCH_W, W / 2) : 0;
+
+    // Move them in one step so the gaps between them never show
+    HDWP dwp = BeginDeferWindowPos(3);
+    if (dwp && searchW)
+        dwp = DeferWindowPos(dwp, g_hwndFolderSearch, NULL, 0, H - statusH - stripH, searchW, stripH,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && showStrip)
-        dwp = DeferWindowPos(dwp, g_hwndFolderBrowser, NULL, 0, H - statusH - stripH, W, stripH,
+        dwp = DeferWindowPos(dwp, g_hwndFolderBrowser, NULL, searchW, H - statusH - stripH, W - searchW, stripH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && g_hwndCanvas)
         dwp = DeferWindowPos(dwp, g_hwndCanvas, NULL, 0, canvasY, W, canvasH,
@@ -14138,6 +14373,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 0, 0, 0, FOLDER_BROWSER_H,
                 hwnd, nullptr, GetModuleHandle(NULL), NULL);
             // hidden by default — shown when toggled
+
+            wcs.lpfnWndProc   = FolderSearchWndProc;
+            wcs.lpszClassName = L"MyPaintFolderSearch";
+            RegisterClassEx(&wcs);
+            g_hwndFolderSearch = CreateWindowEx(0, L"MyPaintFolderSearch", NULL,
+                WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                0, 0, FOLDER_SEARCH_W, FOLDER_BROWSER_H, hwnd, nullptr, GetModuleHandle(NULL), NULL);
+            // shown by Ctrl+F
         }
 
         // Register canvas class
@@ -14573,9 +14816,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_APP:
         // Deferred from WM_CREATE — runs after ShowWindow/SetWindowPos settle the final layout
         CenterScrollOnCanvas();
-        // Reopen the folder browser if it was open at last exit (it takes focus);
-        // this runs after the command-line image is loaded, so it lists that folder
-        if (g_restoreFolderBrowser && !g_showFolderBrowser) ToggleFolderBrowser();
+        // Open the folder browser if it was open the last time MyPaint was started
+        // the same way (with or without an image; it takes focus). This runs after
+        // the command-line image is loaded, so it lists that folder
+        if ((g_startedWithFile ? g_folderBrowserFromFile : g_folderBrowserFromBlank) && !g_showFolderBrowser)
+            ToggleFolderBrowser();
         else if (g_hwndCanvas) SetFocus(g_hwndCanvas);
         return 0;
 
@@ -14710,6 +14955,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         case ID_FOLDER_BROWSER_BTN:
             ToggleFolderBrowser();
+            break;
+        case ID_FOLDER_SEARCH:
+            OpenFolderSearch();
             break;
         case ID_ZOOM_FIT_WINDOW:
             ZoomToFit();
@@ -15298,7 +15546,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
-        if (argc >= 2) LoadImageFromPath(argv[1]);
+        if (argc >= 2) { g_startedWithFile = true; LoadImageFromPath(argv[1]); }
         LocalFree(argv);
     }
 
@@ -15331,7 +15579,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
         }
         if (g_hwndHelp && IsDialogMessage(g_hwndHelp, &msg))
             continue;
-        if (!TranslateAccelerator(hwnd, hAccel, &msg)) {
+        // Ctrl+C, Ctrl+V, Ctrl+A etc. in the strip's text boxes edit the text,
+        // not the image; Ctrl+F still reaches the search
+        bool inStripEdit = msg.hwnd && (msg.hwnd == g_hwndFolderSearchEdit || msg.hwnd == g_hwndFolderRename) &&
+                           !(msg.message == WM_KEYDOWN && msg.wParam == 'F');
+        if (inStripEdit || !TranslateAccelerator(hwnd, hAccel, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }

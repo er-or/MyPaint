@@ -59,6 +59,7 @@ BEGIN
     "A",    ID_EDIT_SELECT_ALL, VIRTKEY, CONTROL
     "X",    ID_IMAGE_CROP,      VIRTKEY, CONTROL, SHIFT
     VK_F11, ID_VIEW_DARKMODE,   VIRTKEY
+    "F",    ID_FOLDER_SEARCH,   VIRTKEY, CONTROL
     // Zoom: Ctrl+= / Ctrl+- (main keys 0xBB / 0xBD, also the numpad), Ctrl+0 fit, Ctrl+1 100%
     0xBB,   ID_ZOOM_IN,         VIRTKEY, CONTROL
     0xBB,   ID_ZOOM_IN,         VIRTKEY, CONTROL, SHIFT

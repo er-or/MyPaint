@@ -37,6 +37,7 @@
 #define ID_FOLDER_BROWSER_BTN        40506
 #define ID_ZOOM_FIT_WINDOW      40507   // Ctrl+0: always fit (the button toggles)
 #define ID_ZOOM_ACTUAL          40508   // Ctrl+1: 100%
+#define ID_FOLDER_SEARCH        40509   // Ctrl+F: search box in the folder browser
 
 // Alpha (opacity) edit
 #define ID_ALPHA_EDIT           40505

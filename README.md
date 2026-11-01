@@ -41,10 +41,15 @@ window responsive, and zoomed-out views of big images scroll smoothly.
 
 ## Folder browser
 
-Hidden by default. Click the **rightmost button in the status bar** to show a
-strip of thumbnails of every image in the open file's folder along the bottom
-of the window. MyPaint remembers whether it was open, and its height, between
-sessions.
+A strip of thumbnails of every image in the open file's folder, along the
+bottom of the window. Click the **rightmost button in the status bar** to show
+or hide it.
+
+It opens by default when MyPaint starts with an image (double-clicking one in
+Explorer, for example) and stays closed when MyPaint starts on its own. Each of
+those remembers your choice separately, so closing it after opening a photo
+doesn't affect starting blank, and vice versa. The strip's height is
+remembered too.
 
 | Action | Does |
 |---|---|
@@ -54,6 +59,7 @@ sessions.
 | Scroll wheel over the strip | Scroll the strip |
 | Delete | Send the open image to the Recycle Bin and open the next one |
 | F2 | Rename the open image in place (Enter saves, Esc cancels) |
+| Ctrl+F | Search: a box at the left end of the strip; only images whose names contain the text are shown (Enter opens the first match, Esc or ✕ closes the search) |
 | Right-click, or the ⋯ button on a thumbnail | Menu for that file (below) |
 | Menu key / Shift+F10 | Menu for the open image |
 | Drag the strip's top edge | Resize it, from 40 px up to half the screen; thumbnails grow with it |
