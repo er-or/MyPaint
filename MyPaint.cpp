@@ -267,6 +267,7 @@ static HICON g_hIcoStatusCrop   = NULL;  // canvas size pane
 static HBITMAP g_hbmFileMenuIcons[8]  = {};
 static HBITMAP g_hbmEditMenuIcons[6]  = {};  // Undo, Redo, Cut, Copy, Paste, SelectAll
 static HBITMAP g_hbmImageMenuIcons[6] = {};  // RotateRight, RotateLeft, FlipH, FlipV, Crop, Resize
+static HBITMAP g_hbmViewMenuIcons[9] = {};   // one per kViewMenuEntries item
 
 // Pre-rendered opaque bitmaps for status bar icons — used in WM_DRAWITEM via BitBlt
 // so the icon draw is a single atomic GDI operation and never flickers.
@@ -644,6 +645,7 @@ static void DoRotateCanvas(bool clockwise);
 static void DoFlipCanvas(bool horizontal);
 static void SetEditMenuIcons();
 static void SetImageMenuIcons();
+static void SetViewMenuIcons();
 
 // Colour helpers
 static Color    GdipColorFromCOLORREF(COLORREF cr, BYTE alpha = 255);
@@ -4667,6 +4669,93 @@ static void SetImageMenuIcons()
     }
 }
 
+// View menu entries. Zoom, folder browser and dark mode reuse their status bar
+// and toolbar artwork; svgD == nullptr items are drawn in SetViewMenuIcons.
+static const ImageMenuEntry kViewMenuEntries[] = {
+    { ID_VIEW_FULLSCREEN,    L"&Full Screen\tF11",        nullptr,             16.0f },
+    { ID_VIEW_SLIDESHOW,     L"&Slideshow\tF5",           nullptr,             16.0f },
+    { ID_ZOOM_IN,            L"Zoom &In\tCtrl+=",         kZoomInD,            20.0f },
+    { ID_ZOOM_OUT,           L"Zoom &Out\tCtrl+-",        kZoomOutD,           20.0f },
+    { ID_ZOOM_FIT_WINDOW,    L"Fi&t to Window\tCtrl+0",   kPageFitD,           20.0f },
+    { ID_ZOOM_ACTUAL,        L"&Actual Size\tCtrl+1",     nullptr,             16.0f },
+    { ID_FOLDER_BROWSER_BTN, L"Folder &Browser",          kFolderBrowserIconD, 20.0f },
+    { ID_VIEW_DARKMODE,      L"&Dark Mode\tCtrl+Shift+D", kMoonD,              24.0f },
+};
+
+// Sets View menu item icons, in the same style as SetImageMenuIcons
+static void SetViewMenuIcons()
+{
+    if (!g_hMenuMain) return;
+    HMENU hView = GetSubMenu(g_hMenuMain, 3);
+    if (!hView) return;
+
+    for (auto& h : g_hbmViewMenuIcons) if (h) { DeleteObject(h); h = NULL; }
+
+    const int sz    = 16;
+    COLORREF crBg   = g_darkMode ? RGB(43, 43, 43)    : GetSysColor(COLOR_MENU);
+    COLORREF crIcon = g_darkMode ? RGB(200, 200, 200) : RGB(45, 45, 45);
+    Color bgClr  (255, GetRValue(crBg),   GetGValue(crBg),   GetBValue(crBg));
+    Color iconClr(255, GetRValue(crIcon), GetGValue(crIcon), GetBValue(crIcon));
+
+    for (int i = 0; i < (int)ARRAYSIZE(kViewMenuEntries); i++) {
+        const ImageMenuEntry& e = kViewMenuEntries[i];
+        Bitmap bmp(sz, sz, PixelFormat32bppRGB);
+        {
+            Graphics g(&bmp);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+            g.Clear(bgClr);
+            SolidBrush br(iconClr);
+            Pen pen(iconClr, 1.2f);
+            pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound); pen.SetLineJoin(LineJoinRound);
+            if (e.svgD) {
+                GraphicsPath path(FillModeWinding);
+                AddSvgPath(path, e.svgD, sz / e.coordSz);
+                g.FillPath(&br, &path);
+            } else if (e.cmdId == ID_VIEW_FULLSCREEN) {
+                // Four corners pointing outwards
+                const float a = 2.5f, b = 13.5f, k = 4.f;
+                PointF tl[3] = { {a, a + k}, {a, a}, {a + k, a} }, tr[3] = { {b - k, a}, {b, a}, {b, a + k} };
+                PointF bl[3] = { {a, b - k}, {a, b}, {a + k, b} }, brc[3] = { {b - k, b}, {b, b}, {b, b - k} };
+                g.DrawLines(&pen, tl, 3); g.DrawLines(&pen, tr, 3); g.DrawLines(&pen, bl, 3); g.DrawLines(&pen, brc, 3);
+            } else if (e.cmdId == ID_VIEW_SLIDESHOW) {
+                // A screen with a play triangle
+                GraphicsPath r;
+                r.AddArc(1.5f, 3.f, 3.f, 3.f, 180, 90); r.AddArc(11.5f, 3.f, 3.f, 3.f, 270, 90);
+                r.AddArc(11.5f, 10.f, 3.f, 3.f, 0, 90); r.AddArc(1.5f, 10.f, 3.f, 3.f, 90, 90);
+                r.CloseFigure();
+                g.DrawPath(&pen, &r);
+                PointF tri[3] = { {6.5f, 5.5f}, {10.5f, 8.f}, {6.5f, 10.5f} };
+                g.FillPolygon(&br, tri, 3);
+            } else if (e.cmdId == ID_ZOOM_ACTUAL) {
+                // "1:1"
+                g.DrawLine(&pen, 4.f, 4.f, 4.f, 12.5f);   g.DrawLine(&pen, 2.5f, 5.5f, 4.f, 4.f);
+                g.DrawLine(&pen, 12.f, 4.f, 12.f, 12.5f); g.DrawLine(&pen, 10.5f, 5.5f, 12.f, 4.f);
+                g.FillEllipse(&br, 7.2f, 6.f, 1.6f, 1.6f);
+                g.FillEllipse(&br, 7.2f, 9.6f, 1.6f, 1.6f);
+            }
+        }
+
+        HDC hdc    = GetDC(NULL);
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, sz, sz);
+        ReleaseDC(NULL, hdc);
+        HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hbm);
+        Graphics gDC(hdcMem);
+        gDC.DrawImage(&bmp, 0, 0, sz, sz);
+        SelectObject(hdcMem, hOld);
+        DeleteDC(hdcMem);
+        g_hbmViewMenuIcons[i] = hbm;
+
+        MENUITEMINFOW mii = { sizeof(mii) };
+        mii.fMask      = MIIM_FTYPE | MIIM_STRING | MIIM_BITMAP;
+        mii.fType      = MFT_STRING;
+        mii.dwTypeData = const_cast<LPWSTR>(e.text);
+        mii.hbmpItem   = hbm;
+        SetMenuItemInfoW(hView, e.cmdId, FALSE, &mii);
+    }
+}
+
 static void ApplyDarkMode()
 {
     BOOL dark = g_darkMode ? TRUE : FALSE;
@@ -4788,6 +4877,7 @@ static void ApplyDarkMode()
     SetFileMenuIcons();
     SetEditMenuIcons();
     SetImageMenuIcons();
+    SetViewMenuIcons();
 
     RedrawWindow(g_hwndMain, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 
