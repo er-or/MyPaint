@@ -1,0 +1,5 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!-- File > Save Options icon: three sliders. Every shape winds clockwise so the
+     knobs join the bars under non-zero fill. MyPaint uses this path data as kFileSaveOptionsD. -->
+<path d="M3.75,6.25 H20.25 V7.75 H3.75 Z M5.5,7 A2.5,2.5 0 1 1 10.5,7 A2.5,2.5 0 1 1 5.5,7 Z M3.75,11.25 H20.25 V12.75 H3.75 Z M12.5,12 A2.5,2.5 0 1 1 17.5,12 A2.5,2.5 0 1 1 12.5,12 Z M3.75,16.25 H20.25 V17.75 H3.75 Z M7.5,17 A2.5,2.5 0 1 1 12.5,17 A2.5,2.5 0 1 1 7.5,17 Z" fill="#ffffff"/>
+</svg>

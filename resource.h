@@ -17,6 +17,7 @@
 #define ID_FILE_PRINT           40007
 #define ID_FILE_DELETE          40008
 #define ID_FILE_INKSCAPE        40009   // added to the File menu at runtime for SVGs
+#define ID_FILE_SAVE_OPTIONS    40030
 #define ID_FILE_RECENT_FIRST    41000   // File > Open Recent entries: 41000 + index (up to 10)
 #define ID_FILE_RECENT_CLEAR    41020
 
@@ -152,13 +153,22 @@
 #define IDC_RESIZE_LOCK_ASPECT  1014
 #define IDC_RESIZE_CANVAS_ONLY  1015
 
-// Dialog control IDs — JPEG / WebP save options
+// Dialog control IDs — File > Save Options
 #define IDC_SAVEOPT_SLIDER      1030
 #define IDC_SAVEOPT_QUALITY     1031
 #define IDC_SAVEOPT_LOSSLESS    1032
 #define IDC_SAVEOPT_SIZE        1033
-#define IDC_SAVEOPT_DONTASK     1034
 #define IDC_SAVEOPT_HINT        1035
+#define IDC_SAVEOPT_TAB_JPEG    1036
+#define IDC_SAVEOPT_TAB_PNG     1037
+#define IDC_SAVEOPT_TAB_WEBP    1038
+#define IDC_SAVEOPT_QLABEL      1039
+#define IDC_SAVEOPT_PNG_FULL    1040
+#define IDC_SAVEOPT_PNG_256     1041
+#define IDC_SAVEOPT_PNG_ALPHA   1042
+#define IDC_SAVEOPT_PNG_HINT    1043
+#define IDC_SAVEOPT_DEFAULTS    1044
+#define IDC_SAVEOPT_WEBP_ALPHA  1045
 
 // Dialog control IDs — Help/About
 #define IDC_HELP_TEXT           1020

@@ -23,10 +23,12 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP (including the first
   frame of animated WebP) and SVG; saves PNG, JPEG, BMP, GIF, TIFF and WebP.
   An SVG is never overwritten: Save on one opens Save As with a PNG name.
-- **JPEG and WebP quality:** Save As to either shows a small optional dialog
-  with a quality slider and an estimated file size (plus Lossless for WebP).
-  Settings are remembered, plain Save never asks, and "Don't ask again" turns
-  it off (hold Shift on Save As to bring it back). Default quality is 90.
+- **Save Options (File menu):** JPEG, PNG and WebP tabs, each showing the
+  estimated size of the open image. JPEG and WebP: quality (default 100);
+  WebP also Lossless. PNG: full colour or 256 colours. PNG and WebP: keep
+  transparency (on by default). Saving never asks; it just uses these
+  settings. PNGs with no transparent areas are saved without a transparency
+  layer, which makes them about a quarter smaller.
 - **Open in Inkscape:** SVG files get an "Open in Inkscape" menu item when
   Inkscape is installed
 

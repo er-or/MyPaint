@@ -15,6 +15,7 @@ BEGIN
         MENUITEM "&Open...\tCtrl+O",        ID_FILE_OPEN
         MENUITEM "&Save\tCtrl+S",           ID_FILE_SAVE
         MENUITEM "Save &As...",             ID_FILE_SAVEAS
+        MENUITEM "Sa&ve Options...",        ID_FILE_SAVE_OPTIONS
         MENUITEM "&Print...\tCtrl+P",       ID_FILE_PRINT
         MENUITEM "&Delete",                 ID_FILE_DELETE
         MENUITEM SEPARATOR
@@ -109,21 +110,35 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 110, 96, 60, 14
 END
 
-// JPEG / WebP save options (shown after Save As picks a lossy format)
-IDD_SAVE_OPTIONS DIALOGEX 0, 0, 236, 112
+// File > Save Options: one page per format, chosen with the tab buttons.
+// The JPEG and WebP pages share the quality controls; the frame around the
+// page (7,22 - 243,108) is drawn in WM_PAINT.
+IDD_SAVE_OPTIONS DIALOGEX 0, 0, 250, 136
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Save Options"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Quality:", IDC_STATIC, 7, 11, 34, 9
-    CONTROL         "", IDC_SAVEOPT_SLIDER, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 40, 7, 152, 16
-    EDITTEXT        IDC_SAVEOPT_QUALITY, 196, 8, 32, 14, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "Higher quality gives a larger file. 90 suits most images.", IDC_SAVEOPT_HINT, 7, 30, 222, 9
-    AUTOCHECKBOX    "Lossless (exact colours, larger file)", IDC_SAVEOPT_LOSSLESS, 7, 29, 222, 10
-    LTEXT           "Estimated size:", IDC_SAVEOPT_SIZE, 7, 47, 222, 9
-    AUTOCHECKBOX    "Don't ask again (hold Shift when choosing Save As to see this)", IDC_SAVEOPT_DONTASK, 7, 66, 222, 10
-    DEFPUSHBUTTON   "Save", IDOK, 122, 91, 52, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 177, 91, 52, 14
+    PUSHBUTTON      "JPEG", IDC_SAVEOPT_TAB_JPEG,   7, 7, 50, 15, BS_OWNERDRAW
+    PUSHBUTTON      "PNG",  IDC_SAVEOPT_TAB_PNG,   58, 7, 50, 15, BS_OWNERDRAW
+    PUSHBUTTON      "WebP", IDC_SAVEOPT_TAB_WEBP, 109, 7, 50, 15, BS_OWNERDRAW
+
+    LTEXT           "Quality:", IDC_SAVEOPT_QLABEL, 16, 33, 32, 9
+    CONTROL         "", IDC_SAVEOPT_SLIDER, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 48, 29, 152, 16
+    EDITTEXT        IDC_SAVEOPT_QUALITY, 204, 30, 30, 14, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Higher quality keeps more detail but gives a larger file. 100 is the best quality.", IDC_SAVEOPT_HINT, 16, 52, 222, 18
+    AUTOCHECKBOX    "Lossless (exact colours, larger file)", IDC_SAVEOPT_LOSSLESS, 16, 52, 222, 10
+    AUTOCHECKBOX    "Keep transparency", IDC_SAVEOPT_WEBP_ALPHA, 16, 66, 222, 10
+
+    AUTORADIOBUTTON "Full colour", IDC_SAVEOPT_PNG_FULL, 16, 30, 222, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "256 colours (much smaller; good for screenshots and graphics)", IDC_SAVEOPT_PNG_256, 16, 43, 222, 10
+    AUTOCHECKBOX    "Keep transparency", IDC_SAVEOPT_PNG_ALPHA, 16, 58, 222, 10, WS_GROUP | WS_TABSTOP
+    LTEXT           "PNG is lossless: the picture is saved exactly. Images with no transparent areas are saved without a transparency layer, which is smaller.", IDC_SAVEOPT_PNG_HINT, 16, 71, 222, 18
+
+    LTEXT           "Estimated size for this image:", IDC_SAVEOPT_SIZE, 16, 94, 222, 9
+
+    PUSHBUTTON      "Restore defaults", IDC_SAVEOPT_DEFAULTS, 7, 115, 68, 14
+    DEFPUSHBUTTON   "OK", IDOK, 137, 115, 52, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 191, 115, 52, 14
 END
 
 // Help / About dialog
