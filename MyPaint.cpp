@@ -2039,7 +2039,9 @@ static INT_PTR CALLBACK SaveOptionsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, L
         SetBkMode(dis->hDC, TRANSPARENT);
         SetTextColor(dis->hDC, sel ? RGB(255, 255, 255) : (g_darkMode ? RGB(220, 220, 220) : RGB(30, 30, 30)));
         DrawTextW(dis->hDC, text, -1, &dis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        if (dis->itemState & ODS_FOCUS) {
+        // Focus outline only once the keyboard is in use, as Windows does for
+        // its own controls (ODS_NOFOCUSRECT is set while focus cues are hidden)
+        if ((dis->itemState & ODS_FOCUS) && !(dis->itemState & ODS_NOFOCUSRECT)) {
             RECT fr = dis->rcItem; InflateRect(&fr, -2, -2);
             DrawFocusRect(dis->hDC, &fr);
         }
