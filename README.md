@@ -14,8 +14,8 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   undo and redo
 - **Opening files:** File → Open, drag and drop onto the window, or
   File → Open Recent (the last 10 images)
-- **Folder browser:** an optional thumbnail strip for flicking through the
-  images in a folder (see below)
+- **Folder browser:** a thumbnail strip for flicking through the images in a
+  folder, with Ctrl+F to search by file name (see below)
 - **Zoom:** fit to window (shrinks large images, never enlarges small ones),
   fill window, Ctrl + scroll; keyboard Ctrl+= / Ctrl+− to zoom, Ctrl+0 to fit,
   Ctrl+1 for 100%
