@@ -19,13 +19,17 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Zoom:** fit to window (shrinks large images, never enlarges small ones),
   fill window, Ctrl + scroll; keyboard Ctrl+= / Ctrl+− to zoom, Ctrl+0 to fit,
   Ctrl+1 for 100%
+- **Animated GIF and WebP:** play by themselves, with a bar above the folder
+  browser: play/pause (Space), step a frame (`,` and `.`), and a track to drag.
+  MyPaint can't save animations yet: editing or saving works on the frame
+  showing, and saving over the animation asks first.
 - **Full screen and slideshow (View menu):** F11 shows the image on black;
   F5 starts a slideshow (3, 5 or 10 seconds per image). The arrow keys and
   scroll wheel step through the folder, Space pauses, Esc returns; moving the
   mouse shows a control bar. A folder browser search limits both to its matches.
 - **Dark and light themes** (Ctrl+Shift+D)
-- **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP (including the first
-  frame of animated WebP) and SVG; saves PNG, JPEG, BMP, GIF, TIFF and WebP.
+- **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP and SVG; saves PNG, JPEG,
+  BMP, GIF, TIFF and WebP.
   HEIC/HEIF (phone photos) and AVIF also open, using Windows' own decoders
   from Microsoft's free Store extensions (HEIF Image Extensions, plus HEVC
   Video Extensions for most phone photos; AV1 Video Extension for AVIF).
@@ -57,6 +61,10 @@ Explorer, for example) and stays closed when MyPaint starts on its own. Each of
 those remembers your choice separately, so closing it after opening a photo
 doesn't affect starting blank, and vice versa. The strip's height is
 remembered too.
+
+The strip updates by itself when files in the folder are added, changed,
+renamed or deleted, keeping its scroll position and highlight. Full screen and
+the slideshow follow the same list.
 
 | Action | Does |
 |---|---|

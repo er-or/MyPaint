@@ -61,6 +61,8 @@ using namespace Gdiplus;
 #include <cassert>
 #include <memory>
 #include <thread>
+#include <atomic>
+#include <functional>
 #include <strsafe.h>
 
 using std::max;
@@ -456,6 +458,9 @@ static bool  g_folderSortDesc = false;
 static int   g_folderTotalCount   = 0;  // images in the folder, before the search filter
 static bool  g_folderSearchOpen   = false;
 static HWND  g_hwndFolderSearch     = NULL;   // search panel at the left end of the strip
+static HWND  g_hwndAnimBar          = NULL;   // animation controls, above the strip
+static bool  g_animActive           = false;  // the open file is an animation: the bar is showing
+static const int ANIM_BAR_H         = 34;
 static HWND  g_hwndFolderSearchEdit = NULL;
 static int   g_folderScrollX = 0;
 static bool  g_updatingZoomEdit = false;
@@ -684,6 +689,17 @@ static void    NavigateToFile(int idx);
 static void    ToggleFolderBrowser();
 static void    OpenFolderSearch();
 static void    EnterFullscreen(bool play);
+static bool    IsAnimatedWebP(const wchar_t* path);
+struct AnimFrameMsg;
+static void    AnimOnInstall(const wchar_t* file, bool isSVG);
+static void    AnimOnFrameMessage(AnimFrameMsg* raw);
+static void    AnimLeaveForEdit();
+static bool    AnimConfirmSave(const wchar_t* filepath);
+static void    AnimOnSaved();
+static void    AnimStop();
+static bool    AnimHandleKey(const MSG& msg);
+static LRESULT CALLBACK AnimBarWndProc(HWND, UINT, WPARAM, LPARAM);
+static constexpr UINT WM_ANIM_FRAME = WM_APP + 0x42;   // lParam: AnimFrameMsg*
 static void    ExitFullscreen();
 static void    CloseFolderSearch();
 static LRESULT CALLBACK FolderSearchWndProc(HWND, UINT, WPARAM, LPARAM);
@@ -792,6 +808,7 @@ static void PushUndo()
 {
     if (!g_pCanvas) return;
     LeaveSvgDisplay();   // every edit starts here
+    AnimLeaveForEdit();
     // Clear redo — new drawing action invalidates the redo history
     for (auto* b : g_redoStack) delete b;
     g_redoStack.clear();
@@ -1042,7 +1059,10 @@ static bool PromptSaveIfNeeded()
     StringCchPrintf(msg, ARRAYSIZE(msg), L"Save changes to \"%s\"?", name);
     int r = MessageBox(g_hwndMain, msg, APP_TITLE, MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return false;
-    if (r == IDYES) DoSave();
+    if (r == IDYES) {
+        DoSave();
+        if (g_modified) return false;   // not saved after all: keep the changes open
+    }
     return true;
 }
 
@@ -1053,6 +1073,7 @@ static void DoNew()
     for (auto* b : g_redoStack) delete b; g_redoStack.clear();
     CancelPaste();
     g_hasSelection = false;
+    AnimStop();
     CreateCanvas(DEFAULT_CANVAS_W, DEFAULT_CANVAS_H, false);
     CenterScrollOnCanvas();
     g_currentFile[0] = L'\0';
@@ -1800,6 +1821,7 @@ static void InstallCanvasImage(Bitmap* bmp, const wchar_t* file, bool isSVG, boo
     StringCchCopy(g_currentFile, MAX_PATH, file);
     AddRecentFile(file);
     g_modified = false;
+    AnimOnInstall(file, isSVG);   // before the zoom, which needs the bar's height settled
     if (!callerFits) {
         if (g_isSvgFile) RebuildSvgDisplayBitmap();
         CenterScrollOnCanvas();
@@ -1973,6 +1995,7 @@ static void SaveToFile(const wchar_t* filepath)
                    APP_TITLE, MB_ICONWARNING);
         return;
     }
+    if (!AnimConfirmSave(filepath)) return;
     const wchar_t* dot = wcsrchr(filepath, L'.');
     bool isWebP = dot && _wcsicmp(dot + 1, L"webp") == 0;
 
@@ -1999,6 +2022,7 @@ static void SaveToFile(const wchar_t* filepath)
         StringCchCopy(g_currentFile, MAX_PATH, filepath);
         AddRecentFile(filepath);
         g_modified = false;
+        AnimOnSaved();
         if (g_isSvgFile) {
             // Now a raster file: stop re-rendering the display from SVG source
             g_isSvgFile = false;
@@ -3075,8 +3099,61 @@ static bool IsImageExtension(const wchar_t* ext)
     return false;
 }
 
+// ─── Folder watcher ──────────────────────────────────────────
+// While the folder list is in use, a thread watches its folder and tells the
+// main window when files appear, change or go. It waits for a short quiet
+// spell first, so a batch of files being copied is one refresh rather than
+// hundreds, but refreshes at least every 2 seconds during a long copy.
+static constexpr UINT WM_FOLDER_CHANGED = WM_APP + 0x41;
+static HANDLE       g_folderWatchStop = NULL;
+static std::thread  g_folderWatchThread;
+static std::wstring g_folderWatchDir;
+
+static void StopFolderWatch()
+{
+    if (g_folderWatchThread.joinable()) {
+        SetEvent(g_folderWatchStop);
+        g_folderWatchThread.join();
+    }
+    if (g_folderWatchStop) { CloseHandle(g_folderWatchStop); g_folderWatchStop = NULL; }
+    g_folderWatchDir.clear();
+}
+
+static void StartFolderWatch(const wchar_t* dir)
+{
+    if (g_folderWatchThread.joinable() && _wcsicmp(g_folderWatchDir.c_str(), dir) == 0) return;
+    StopFolderWatch();
+    g_folderWatchStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_folderWatchStop) return;
+    g_folderWatchDir = dir;
+    HANDLE stop = g_folderWatchStop;
+    HWND target = g_hwndMain;
+    std::wstring path = dir;
+    g_folderWatchThread = std::thread([stop, target, path] {
+        // Some network drives can't be watched; the list then updates as before
+        HANDLE change = FindFirstChangeNotificationW(path.c_str(), FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+        if (change == INVALID_HANDLE_VALUE) return;
+        HANDLE waits[2] = { stop, change };
+        bool running = true;
+        while (running && WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+            DWORD first = GetTickCount();
+            for (;;) {
+                if (!FindNextChangeNotification(change)) { running = false; break; }   // the folder went away
+                DWORD w = WaitForMultipleObjects(2, waits, FALSE, 300);
+                if (w == WAIT_OBJECT_0) { running = false; break; }
+                if (w != WAIT_OBJECT_0 + 1 || GetTickCount() - first > 2000) break;
+            }
+            if (WaitForSingleObject(stop, 0) != WAIT_OBJECT_0)
+                PostMessage(target, WM_FOLDER_CHANGED, 0, 0);
+        }
+        FindCloseChangeNotification(change);
+    });
+}
+
 static void FreeFolderThumbs()
 {
+    StopFolderWatch();
     for (auto& e : g_folderEntries) { delete e.thumb; e.thumb = nullptr; }
     for (auto& e : g_folderHiddenEntries) delete e.thumb;
     g_folderEntries.clear();
@@ -3177,6 +3254,8 @@ static void BuildFolderList()
         GetCurrentDirectoryW(MAX_PATH, dir);
     }
 
+    StartFolderWatch(dir);   // before scanning, so nothing is missed in between
+
     wchar_t pattern[MAX_PATH];
     StringCchCopy(pattern, MAX_PATH, dir);
     PathAppendW(pattern, L"*.*");
@@ -3208,7 +3287,7 @@ static void BuildFolderList()
     for (auto& e : g_folderEntries) {
         auto it = std::lower_bound(old.begin(), old.end(), e, byPath);
         if (it != old.end() && _wcsicmp(it->path.c_str(), e.path.c_str()) == 0 &&
-            CompareFileTime(&it->modified, &e.modified) == 0) {
+            CompareFileTime(&it->modified, &e.modified) == 0 && it->size == e.size) {
             e.thumb  = it->thumb;  it->thumb = nullptr;
             e.failed = it->failed;
             e.stale  = it->stale;
@@ -4933,6 +5012,7 @@ static void ApplyDarkMode()
     if (g_hwndFolderBrowserBtn)  InvalidateRect(g_hwndFolderBrowserBtn,  NULL, TRUE);
     if (g_hwndFolderBrowser)    InvalidateRect(g_hwndFolderBrowser,    NULL, TRUE);
     if (g_hwndFolderSearch)     InvalidateRect(g_hwndFolderSearch,     NULL, TRUE);
+    if (g_hwndAnimBar)          InvalidateRect(g_hwndAnimBar,          NULL, FALSE);
     if (g_hwndFolderSearchEdit) InvalidateRect(g_hwndFolderSearchEdit, NULL, TRUE);
     if (g_hwndColorEdit)  InvalidateRect(g_hwndColorEdit,  NULL, TRUE);
     if (g_hwndReset)      InvalidateRect(g_hwndReset,      NULL, TRUE);
@@ -7418,6 +7498,15 @@ L"Zoom controls in the status bar (bottom-right)\r\n"
 L"Fit to window       Shrinks large images to fit; small images stay\r\n"
 L"                    at 100% (SVGs still scale up, as they stay sharp)\r\n"
 L"\r\n"
+L"ANIMATED GIF AND WEBP\r\n"
+L"---------------------\r\n"
+L"Animated files play by themselves, with a bar above the folder browser.\r\n"
+L"Space               Play / pause\r\n"
+L", and .             Previous / next frame\r\n"
+L"Drag the track      Move to any frame\r\n"
+L"MyPaint can't save animations yet. Editing or saving works on the frame\r\n"
+L"showing, and saving over the animation asks first.\r\n"
+L"\r\n"
 L"FULL SCREEN AND SLIDESHOW  (View menu)\r\n"
 L"--------------------------------------\r\n"
 L"F11                 Full screen: the image on black, nothing else\r\n"
@@ -7473,6 +7562,8 @@ L"along the bottom of the window. Handy for flicking through photos.\r\n"
 L"It opens by default when you start MyPaint with an image (for\r\n"
 L"example by double-clicking one), and stays closed when you start\r\n"
 L"it on its own. Each way remembers your choice separately.\r\n"
+L"It updates by itself when files in the folder are added, changed,\r\n"
+L"renamed or deleted.\r\n"
 L"\r\n"
 L"Open / close        Rightmost button in the status bar. MyPaint\r\n"
 L"                    also remembers the strip's height.\r\n"
@@ -12540,6 +12631,41 @@ static void BeginFolderRename(HWND strip, int idx, int cx)
     SetFocus(g_hwndFolderRename);
 }
 
+static bool g_folderMenuOpen = false;   // its choices act on a list position
+
+// The watcher saw a change: rereads the folder, leaving the strip's scroll
+// position and highlight where they are. Waits while a rename box or thumbnail
+// menu is open, since those are tied to a position in the list.
+static void RefreshFolderListFromDisk()
+{
+    if (!g_showFolderBrowser && !g_hwndFullscreen) { StopFolderWatch(); return; }
+    if (g_hwndFolderRename || g_folderMenuOpen) {
+        SetTimer(g_hwndMain, 0xF01D, 1000, [](HWND hwnd, UINT, UINT_PTR id, DWORD) {
+            KillTimer(hwnd, id);
+            PostMessage(hwnd, WM_FOLDER_CHANGED, 0, 0);
+        });
+        return;
+    }
+    std::wstring highlighted;
+    if (g_folderCurrentIdx >= 0 && g_folderCurrentIdx < (int)g_folderEntries.size())
+        highlighted = g_folderEntries[g_folderCurrentIdx].path;
+    int scrollX = g_folderScrollX;
+    // A file still being copied can't be read yet: try the failed ones again
+    for (auto& e : g_folderEntries)       e.failed = false;
+    for (auto& e : g_folderHiddenEntries) e.failed = false;
+
+    HCURSOR cursor = GetCursor();
+    BuildFolderList();
+    SetCursor(cursor);
+
+    g_folderScrollX = scrollX;
+    if (!highlighted.empty())
+        for (int i = 0; i < (int)g_folderEntries.size(); i++)
+            if (_wcsicmp(g_folderEntries[i].path.c_str(), highlighted.c_str()) == 0) { g_folderCurrentIdx = i; break; }
+    if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
+    if (g_hwndFullscreen) InvalidateRect(g_hwndFullscreen, NULL, FALSE);   // its "3 / 14"
+}
+
 // Fills a Sort by menu (strip menus, View > Folder Browser Sort) with the
 // choices, the current ones marked
 static void FillFolderSortMenu(HMENU m)
@@ -12639,8 +12765,10 @@ static void ShowFolderItemMenu(HWND strip, int idx, int cx, POINT screenPt, UINT
     AppendMenuW(hm, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hm, MF_POPUP, (UINT_PTR)hSort, L"Sort &by");
 
+    g_folderMenuOpen = true;
     int cmd = (int)TrackPopupMenu(hm, align | TPM_TOPALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                   screenPt.x, screenPt.y, 0, g_hwndMain, NULL);
+    g_folderMenuOpen = false;
     DestroyMenu(hm);
     for (HBITMAP hb : icons) DeleteObject(hb);
 
@@ -13545,6 +13673,567 @@ static void ExitFullscreen()
     } else if (g_hwndCanvas) SetFocus(g_hwndCanvas);
 }
 
+// ─── Animated GIF / WebP playback ────────────────────────────
+// Opening an animated file shows a control bar above the strip. A worker thread
+// composites every frame into a full-size buffer and posts them here one at a
+// time, so playback starts at once and carries on as the rest arrive. Showing a
+// frame copies it into the canvas, so zoom, panning, full screen, copy and print
+// all simply see the current frame. The first edit drops the other frames: from
+// then on the document is that one frame (MyPaint can't save animations).
+static const size_t ANIM_MAX_BYTES = (size_t)1024 * 1024 * 1024;   // decoding stops here; what fits still plays
+
+struct AnimFrame { std::vector<BYTE> px; int delayMs = 100; };
+struct AnimFrameMsg {
+    unsigned gen = 0;
+    int total = 0, w = 0, h = 0;
+    AnimFrame frame;      // empty on the final message
+    bool done = false;
+};
+
+static std::vector<AnimFrame> g_animFrames;
+static int      g_animTotal = 0, g_animCur = 0, g_animW = 0, g_animH = 0;
+static bool     g_animPlaying = false, g_animLoadDone = false;
+static bool     g_animEdited = false;       // edited: g_animFrames is gone, the bar only explains
+static int      g_animEditedFrame = 0;      // 1-based frame that became the document
+static bool     g_animReplacing = false;    // InstallCanvasImage is resizing the canvas for the animation
+static unsigned g_animGen = 0;              // messages from older decodes are dropped
+static std::shared_ptr<std::atomic<bool>> g_animCancel;
+static const UINT_PTR ANIM_TIMER_ID = 0xF01E;
+enum { ABTN_PREV, ABTN_PLAY, ABTN_NEXT, ABTN_COUNT };
+static int  g_animHot = -1;                 // bar button under the mouse
+static bool g_animScrubbing = false, g_animWasPlaying = false;
+
+static bool IsAnimatedGif(const wchar_t* path)
+{
+    IWICImagingFactory* fac = nullptr;
+    IWICBitmapDecoder*  dec = nullptr;
+    UINT n = 0;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) &&
+        SUCCEEDED(fac->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)))
+        dec->GetFrameCount(&n);
+    if (dec) dec->Release();
+    if (fac) fac->Release();
+    return n > 1;
+}
+
+static bool IsAnimatedFile(const wchar_t* path)
+{
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return false;
+    if (_wcsicmp(dot + 1, L"gif") == 0)  return IsAnimatedGif(path);
+    if (_wcsicmp(dot + 1, L"webp") == 0) return IsAnimatedWebP(path);
+    return false;
+}
+
+// Browsers treat very short delays as 100 ms, and files are made to expect that
+static int AnimDelayMs(int ms) { return ms <= 10 ? 100 : ms; }
+
+// Decodes all frames of a GIF: each frame is a patch placed on the logical
+// screen, and its disposal method says what happens to it before the next one.
+static void AnimDecodeGif(const wchar_t* path, const std::function<bool(AnimFrameMsg*)>& post, int* pTotal, int* pW, int* pH)
+{
+    IWICImagingFactory* fac = nullptr;
+    IWICBitmapDecoder*  dec = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) ||
+        FAILED(fac->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) {
+        if (fac) fac->Release();
+        return;
+    }
+    auto read = [](IWICMetadataQueryReader* q, const wchar_t* name, UINT def) {
+        PROPVARIANT v; PropVariantInit(&v);
+        UINT r = def;
+        if (q && SUCCEEDED(q->GetMetadataByName(name, &v))) {
+            if (v.vt == VT_UI2) r = v.uiVal;
+            else if (v.vt == VT_UI1) r = v.bVal;
+        }
+        PropVariantClear(&v);
+        return r;
+    };
+    UINT total = 0;
+    dec->GetFrameCount(&total);
+    *pTotal = (int)total;
+    IWICMetadataQueryReader* gq = nullptr;
+    dec->GetMetadataQueryReader(&gq);
+    UINT sw = read(gq, L"/logscrdesc/Width", 0), sh = read(gq, L"/logscrdesc/Height", 0);
+    if (gq) gq->Release();
+
+    std::vector<BYTE> screen, saved, patch;
+    size_t bytes = 0;
+    int prevDisposal = 0;
+    UINT prevL = 0, prevT = 0, prevW = 0, prevH = 0;
+    for (UINT i = 0; i < total; i++) {
+        IWICBitmapFrameDecode*   frame = nullptr;
+        IWICFormatConverter*     conv  = nullptr;
+        IWICMetadataQueryReader* q     = nullptr;
+        UINT fw = 0, fh = 0;
+        bool ok = SUCCEEDED(dec->GetFrame(i, &frame)) && SUCCEEDED(fac->CreateFormatConverter(&conv)) &&
+                  SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+                                             nullptr, 0.0, WICBitmapPaletteTypeCustom)) &&
+                  SUCCEEDED(conv->GetSize(&fw, &fh));
+        if (ok) {
+            frame->GetMetadataQueryReader(&q);
+            if (sw == 0 || sh == 0) { sw = fw; sh = fh; }   // no logical screen: the first frame's size
+            if (screen.empty()) screen.assign((size_t)sw * sh * 4, 0);
+            *pW = (int)sw; *pH = (int)sh;
+
+            // What the previous frame asked to happen before this one is drawn
+            if (prevDisposal == 3 && saved.size() == screen.size()) {
+                screen = saved;
+            } else if (prevDisposal == 2) {
+                for (UINT y = prevT; y < min(prevT + prevH, sh); y++)
+                    if (prevL < sw) memset(&screen[((size_t)y * sw + prevL) * 4], 0, (size_t)(min(prevL + prevW, sw) - prevL) * 4);
+            }
+            UINT L = read(q, L"/imgdesc/Left", 0), T = read(q, L"/imgdesc/Top", 0);
+            int  disposal = (int)read(q, L"/grctlext/Disposal", 0);
+            int  delay    = (int)read(q, L"/grctlext/Delay", 0) * 10;
+            if (disposal == 3) saved = screen;
+
+            patch.resize((size_t)fw * fh * 4);
+            ok = SUCCEEDED(conv->CopyPixels(nullptr, fw * 4, (UINT)patch.size(), patch.data()));
+            if (ok) {
+                for (UINT y = 0; y < fh && T + y < sh; y++) {
+                    const BYTE* s = &patch[(size_t)y * fw * 4];
+                    BYTE* d = &screen[((size_t)(T + y) * sw + L) * 4];
+                    for (UINT x = 0; x < fw && L + x < sw; x++, s += 4, d += 4)
+                        if (s[3]) memcpy(d, s, 4);   // GIF pixels are opaque or clear
+                }
+                prevDisposal = disposal; prevL = L; prevT = T; prevW = fw; prevH = fh;
+                bytes += screen.size();
+                auto* m = new AnimFrameMsg();
+                m->frame.px = screen;
+                m->frame.delayMs = AnimDelayMs(delay);
+                if (!post(m)) ok = false;
+            }
+        }
+        if (q)     q->Release();
+        if (conv)  conv->Release();
+        if (frame) frame->Release();
+        if (!ok || bytes + screen.size() > ANIM_MAX_BYTES) break;
+    }
+    dec->Release();
+    fac->Release();
+}
+
+// Decodes all frames of an animated WebP; libwebp does the compositing
+static void AnimDecodeWebP(const wchar_t* path, const std::function<bool(AnimFrameMsg*)>& post, int* pTotal, int* pW, int* pH)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> data((size_t)max(fileSize, 0L));
+    size_t got = fread(data.data(), 1, data.size(), f);
+    fclose(f);
+    WebPAnimDecoderOptions opts;
+    if (got != data.size() || !WebPAnimDecoderOptionsInit(&opts)) return;
+    opts.color_mode = MODE_BGRA;
+    WebPData wd = { data.data(), data.size() };
+    WebPAnimDecoder* dec = WebPAnimDecoderNew(&wd, &opts);
+    if (!dec) return;
+    WebPAnimInfo info;
+    if (WebPAnimDecoderGetInfo(dec, &info)) {
+        *pTotal = (int)info.frame_count; *pW = (int)info.canvas_width; *pH = (int)info.canvas_height;
+        size_t frameBytes = (size_t)info.canvas_width * info.canvas_height * 4, bytes = 0;
+        int prevTs = 0;
+        uint8_t* px = nullptr;
+        int ts = 0;
+        while (bytes + frameBytes <= ANIM_MAX_BYTES && WebPAnimDecoderHasMoreFrames(dec) &&
+               WebPAnimDecoderGetNext(dec, &px, &ts) && px) {
+            auto* m = new AnimFrameMsg();
+            m->frame.px.assign(px, px + frameBytes);
+            m->frame.delayMs = AnimDelayMs(ts - prevTs);   // ts is when this frame ends
+            prevTs = ts;
+            bytes += frameBytes;
+            if (!post(m)) break;
+        }
+    }
+    WebPAnimDecoderDelete(dec);
+}
+
+static void AnimStartDecode(const std::wstring& path)
+{
+    g_animCancel = std::make_shared<std::atomic<bool>>(false);
+    auto cancel = g_animCancel;
+    unsigned gen = g_animGen;
+    HWND target = g_hwndMain;
+    std::thread([path, cancel, gen, target] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        int total = 0, w = 0, h = 0;
+        auto post = [&](AnimFrameMsg* m) -> bool {
+            m->gen = gen; m->total = total; m->w = w; m->h = h;
+            if (!cancel->load() && PostMessage(target, WM_ANIM_FRAME, 0, (LPARAM)m)) return true;
+            delete m;
+            return false;
+        };
+        try {
+            const wchar_t* dot = wcsrchr(path.c_str(), L'.');
+            if (dot && _wcsicmp(dot + 1, L"gif") == 0) AnimDecodeGif(path.c_str(), post, &total, &w, &h);
+            else                                       AnimDecodeWebP(path.c_str(), post, &total, &w, &h);
+        } catch (const std::bad_alloc&) {
+            // Out of memory: the frames that fitted still play
+        }
+        CoUninitialize();
+        auto* done = new AnimFrameMsg();
+        done->done = true;
+        post(done);
+    }).detach();
+}
+
+static void AnimFreeFrames()
+{
+    if (g_animCancel) g_animCancel->store(true);
+    g_animGen++;
+    KillTimer(g_hwndMain, ANIM_TIMER_ID);
+    g_animPlaying = false;
+    std::vector<AnimFrame>().swap(g_animFrames);
+}
+
+// Shows or hides the bar to match g_animActive; the canvas gives up or takes back its height
+static void AnimSyncBar()
+{
+    if (!g_hwndAnimBar) return;
+    bool shown = IsWindowVisible(g_hwndAnimBar) != FALSE;
+    if (shown && !g_animActive) ShowWindow(g_hwndAnimBar, SW_HIDE);
+    if (shown != g_animActive && g_hwndMain) LayoutCanvasAndFolderBrowser(g_hwndMain);
+    if (!shown && g_animActive) ShowWindow(g_hwndAnimBar, SW_SHOW);
+    InvalidateRect(g_hwndAnimBar, NULL, FALSE);
+}
+
+static void AnimStop()
+{
+    AnimFreeFrames();
+    g_animActive = false;
+    g_animEdited = false;
+    g_animTotal = 0;
+    g_animCur = 0;
+    AnimSyncBar();
+}
+
+// Called for every image that becomes the document
+static void AnimOnInstall(const wchar_t* file, bool isSVG)
+{
+    if (g_animReplacing) return;
+    AnimFreeFrames();
+    g_animEdited = false;
+    g_animTotal = 0;
+    g_animCur = 0;
+    g_animLoadDone = false;
+    g_animActive = !isSVG && IsAnimatedFile(file);
+    if (g_animActive) {
+        g_animPlaying = true;
+        AnimStartDecode(file);
+    }
+    AnimSyncBar();
+}
+
+static void AnimShowFrame(int i)
+{
+    if (i < 0 || i >= (int)g_animFrames.size() || !g_pCanvas) return;
+    g_animCur = i;
+    if ((int)g_pCanvas->GetWidth() == g_animW && (int)g_pCanvas->GetHeight() == g_animH) {
+        Rect rc(0, 0, g_animW, g_animH);
+        BitmapData bd;
+        if (g_pCanvas->LockBits(&rc, ImageLockModeWrite, PixelFormat32bppARGB, &bd) == Ok) {
+            const BYTE* s = g_animFrames[i].px.data();
+            for (int y = 0; y < g_animH; y++)
+                memcpy((BYTE*)bd.Scan0 + y * bd.Stride, s + (size_t)y * g_animW * 4, (size_t)g_animW * 4);
+            g_pCanvas->UnlockBits(&bd);
+        }
+        InvalidateCanvas();
+    }
+    if (g_hwndAnimBar) InvalidateRect(g_hwndAnimBar, NULL, FALSE);
+}
+
+static void CALLBACK AnimTimerProc(HWND, UINT, UINT_PTR, DWORD);
+
+static void AnimSchedule(int ms)
+{
+    SetTimer(g_hwndMain, ANIM_TIMER_ID, (UINT)ms, AnimTimerProc);
+}
+
+static void CALLBACK AnimTimerProc(HWND, UINT, UINT_PTR, DWORD)
+{
+    KillTimer(g_hwndMain, ANIM_TIMER_ID);
+    if (!g_animPlaying || g_animFrames.empty()) return;
+    // Nothing to see while minimised or while the next file loads behind the spinner
+    if (IsIconic(g_hwndMain) || g_imageLoading) { AnimSchedule(100); return; }
+    int next = g_animCur + 1;
+    if (next >= (int)g_animFrames.size()) {
+        if (!g_animLoadDone) { AnimSchedule(20); return; }   // the next frame is still decoding
+        next = 0;
+    }
+    AnimShowFrame(next);
+    AnimSchedule(g_animFrames[next].delayMs);
+}
+
+static void AnimSetPlaying(bool play)
+{
+    KillTimer(g_hwndMain, ANIM_TIMER_ID);
+    g_animPlaying = play && !g_animEdited && g_animActive;
+    if (g_animPlaying && g_animCur < (int)g_animFrames.size()) AnimSchedule(g_animFrames[g_animCur].delayMs);
+    if (g_hwndAnimBar) InvalidateRect(g_hwndAnimBar, NULL, FALSE);
+}
+
+// Steps one frame, wrapping around, and pauses
+static void AnimStep(int dir)
+{
+    int n = (int)g_animFrames.size();
+    if (n == 0) return;
+    AnimSetPlaying(false);
+    AnimShowFrame((g_animCur + dir + n) % n);
+}
+
+// WM_ANIM_FRAME: a frame (or the end of the frames) from the worker thread
+static void AnimOnFrameMessage(AnimFrameMsg* raw)
+{
+    std::unique_ptr<AnimFrameMsg> m(raw);
+    if (m->gen != g_animGen) return;
+    if (m->done) {
+        g_animLoadDone = true;
+        if (g_hwndAnimBar) InvalidateRect(g_hwndAnimBar, NULL, FALSE);
+        return;
+    }
+    g_animTotal = m->total;
+    g_animW = m->w;
+    g_animH = m->h;
+    bool first = g_animFrames.empty();
+    g_animFrames.push_back(std::move(m->frame));
+    if (first) {
+        // A GIF's first frame can be smaller than its logical screen
+        if (g_pCanvas && ((int)g_pCanvas->GetWidth() != g_animW || (int)g_pCanvas->GetHeight() != g_animH)) {
+            DecodedImage img;
+            img.w = g_animW; img.h = g_animH;
+            img.px = g_animFrames[0].px;
+            if (Bitmap* b = MakeBitmapFromPixels(img)) {
+                wchar_t file[MAX_PATH];
+                StringCchCopy(file, MAX_PATH, g_currentFile);
+                g_animReplacing = true;
+                InstallCanvasImage(b, file, false, true, 1.0f, true);
+                g_animReplacing = false;
+                if (g_zoomFitMode) ZoomToFit();
+            }
+        }
+        AnimShowFrame(0);
+        if (g_animPlaying) AnimSchedule(g_animFrames[0].delayMs);
+    }
+    if (g_hwndAnimBar) InvalidateRect(g_hwndAnimBar, NULL, FALSE);
+}
+
+// PushUndo calls this: every edit starts there. The bar stays where it is, so
+// the image doesn't jump under the pen, and says what has happened.
+static void AnimLeaveForEdit()
+{
+    if (!g_animActive || g_animEdited) return;
+    g_animEditedFrame = g_animCur + 1;
+    AnimFreeFrames();
+    g_animEdited = true;
+    if (GetCapture() == g_hwndAnimBar) ReleaseCapture();
+    g_animScrubbing = false;
+    if (g_hwndAnimBar) InvalidateRect(g_hwndAnimBar, NULL, FALSE);
+}
+
+// Asked before saving an animation. False: don't save.
+static bool AnimConfirmSave(const wchar_t* filepath)
+{
+    if (!g_animActive) return true;
+    AnimSetPlaying(false);
+    int frame = g_animEdited ? g_animEditedFrame : g_animCur + 1;
+    wchar_t msg[MAX_PATH + 300];
+    if (_wcsicmp(filepath, g_currentFile) == 0) {
+        StringCchPrintf(msg, ARRAYSIZE(msg),
+            L"\"%s\" is an animation, and MyPaint can't save animations yet.\n\n"
+            L"Saving here replaces it with a still image of frame %d, and the other frames are lost.\n\n"
+            L"Replace it anyway?", PathFindFileNameW(filepath), frame);
+        return MessageBox(g_hwndMain, msg, APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+    }
+    StringCchPrintf(msg, ARRAYSIZE(msg),
+        L"MyPaint can't save animations yet, so this saves only frame %d, as a still image. "
+        L"The original file isn't changed.", frame);
+    return MessageBox(g_hwndMain, msg, APP_TITLE, MB_OKCANCEL | MB_ICONINFORMATION) == IDOK;
+}
+
+// After a successful save the document is a still image
+static void AnimOnSaved()
+{
+    if (!g_animActive) return;
+    AnimStop();
+    if (g_zoomFitMode) ZoomToFit();
+}
+
+// Space and , . for the player, when no text is being typed
+static bool AnimHandleKey(const MSG& msg)
+{
+    if (msg.message != WM_KEYDOWN || !g_animActive || g_animEdited || g_textInline) return false;
+    if (msg.hwnd != g_hwndCanvas && msg.hwnd != g_hwndFolderBrowser && msg.hwnd != g_hwndAnimBar && msg.hwnd != g_hwndMain)
+        return false;
+    if (GetKeyState(VK_CONTROL) & 0x8000) return false;
+    switch (msg.wParam) {
+    case VK_SPACE:      AnimSetPlaying(!g_animPlaying); return true;
+    case VK_OEM_COMMA:  AnimStep(-1); return true;
+    case VK_OEM_PERIOD: AnimStep(+1); return true;
+    }
+    return false;
+}
+
+static RECT AnimButtonRect(int b, int h) { int x = 8 + b * 30; return { x, (h - 26) / 2, x + 28, (h + 26) / 2 }; }
+static RECT AnimTrackRect(int w, int h) { return { 112, h / 2 - 2, max(120, w - 170), h / 2 + 2 }; }
+
+static int AnimFrameAtX(int x, int w, int h)
+{
+    RECT t = AnimTrackRect(w, h);
+    int total = max(g_animTotal, 1);
+    int f = total > 1 ? (int)((double)(x - t.left) / (t.right - t.left) * (total - 1) + 0.5) : 0;
+    return max(0, min(f, (int)g_animFrames.size() - 1));
+}
+
+static LRESULT CALLBACK AnimBarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        Bitmap back(max(1, (int)rc.right), max(1, (int)rc.bottom), PixelFormat32bppPARGB);
+        {
+            Graphics g(&back);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+            g.Clear(g_darkMode ? Color(255, 28, 28, 28) : Color(255, 235, 235, 235));
+            Pen sep(g_darkMode ? Color(255, 60, 60, 60) : Color(255, 180, 180, 180), 1.f);
+            g.SetSmoothingMode(SmoothingModeNone);
+            g.DrawLine(&sep, 0, 0, (int)rc.right, 0);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+
+            Color ink = g_darkMode ? Color(255, 220, 220, 220) : Color(255, 45, 45, 45);
+            SolidBrush fg(ink);
+            FontFamily ff(L"Segoe UI");
+            Font font(&ff, 9.f, FontStyleRegular, UnitPoint);
+            StringFormat sf;
+            sf.SetLineAlignment(StringAlignmentCenter);
+            sf.SetTrimming(StringTrimmingEllipsisCharacter);
+            sf.SetFormatFlags(StringFormatFlagsNoWrap);
+
+            if (g_animEdited) {
+                wchar_t text[200];
+                StringCchPrintf(text, ARRAYSIZE(text),
+                    L"Editing frame %d of %d. Saving keeps only this frame; reopen the file for the animation.",
+                    g_animEditedFrame, g_animTotal);
+                g.DrawString(text, -1, &font, RectF(10.f, 0.f, (REAL)rc.right - 20.f, (REAL)rc.bottom), &sf, &fg);
+            } else {
+                SolidBrush hot(g_darkMode ? Color(255, 70, 70, 70) : Color(255, 205, 205, 205));
+                for (int b = 0; b < ABTN_COUNT; b++) {
+                    RECT r = AnimButtonRect(b, rc.bottom);
+                    float cx = (r.left + r.right) / 2.f, cy = (r.top + r.bottom) / 2.f;
+                    if (b == g_animHot) g.FillEllipse(&hot, cx - 13.f, cy - 13.f, 26.f, 26.f);
+                    if (b == ABTN_PLAY) {
+                        if (g_animPlaying) { g.FillRectangle(&fg, cx - 5.f, cy - 6.f, 3.5f, 12.f); g.FillRectangle(&fg, cx + 1.5f, cy - 6.f, 3.5f, 12.f); }
+                        else { PointF tri[3] = { {cx - 4, cy - 7}, {cx + 7, cy}, {cx - 4, cy + 7} }; g.FillPolygon(&fg, tri, 3); }
+                    } else {
+                        float s = b == ABTN_NEXT ? 1.f : -1.f;
+                        PointF tri[3] = { {cx - 4*s, cy - 6}, {cx + 4*s, cy}, {cx - 4*s, cy + 6} };
+                        g.FillPolygon(&fg, tri, 3);
+                        g.FillRectangle(&fg, s > 0 ? cx + 4.f : cx - 5.5f, cy - 6.f, 1.5f, 12.f);
+                    }
+                }
+                // Track: what has decoded, how far along, and the handle
+                RECT t = AnimTrackRect(rc.right, rc.bottom);
+                float tw = (float)(t.right - t.left);
+                int total = max(g_animTotal, 1), loaded = (int)g_animFrames.size();
+                SolidBrush rail(g_darkMode ? Color(255, 60, 60, 60) : Color(255, 200, 200, 200));
+                SolidBrush have(g_darkMode ? Color(255, 110, 110, 110) : Color(255, 160, 160, 160));
+                SolidBrush done(Color(255, 0, 120, 215));
+                float y = (float)t.top, th = (float)(t.bottom - t.top);
+                g.FillRectangle(&rail, (float)t.left, y, tw, th);
+                float haveX = total > 1 ? tw * min(loaded - 1, total - 1) / (total - 1) : tw;
+                g.FillRectangle(&have, (float)t.left, y, max(0.f, haveX), th);
+                float posX = total > 1 ? tw * g_animCur / (total - 1) : 0.f;
+                g.FillRectangle(&done, (float)t.left, y, posX, th);
+                g.FillEllipse(&done, t.left + posX - 6.f, y + th / 2 - 6.f, 12.f, 12.f);
+
+                wchar_t text[64];
+                int delay = g_animCur < loaded ? g_animFrames[g_animCur].delayMs : 0;
+                if (g_animLoadDone && loaded < total)   // too big to load it all
+                    StringCchPrintf(text, ARRAYSIZE(text), L"%d / %d of %d   %d ms", g_animCur + 1, loaded, total, delay);
+                else
+                    StringCchPrintf(text, ARRAYSIZE(text), L"%d / %d   %d ms", g_animCur + 1, total, delay);
+                g.DrawString(text, -1, &font, RectF((REAL)t.right + 14.f, 0.f, (REAL)rc.right - t.right - 18.f, (REAL)rc.bottom), &sf, &fg);
+            }
+        }
+        Graphics screen(hdc);
+        screen.DrawImage(&back, 0, 0, rc.right, rc.bottom);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_SIZE:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        if (g_animEdited) return 0;
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        for (int b = 0; b < ABTN_COUNT; b++) {
+            RECT r = AnimButtonRect(b, rc.bottom);
+            if (!PtInRect(&r, pt)) continue;
+            if (b == ABTN_PLAY) AnimSetPlaying(!g_animPlaying);
+            else AnimStep(b == ABTN_NEXT ? +1 : -1);
+            return 0;
+        }
+        RECT t = AnimTrackRect(rc.right, rc.bottom);
+        if (pt.x >= t.left - 6 && pt.x <= t.right + 6 && !g_animFrames.empty()) {
+            g_animScrubbing = true;
+            g_animWasPlaying = g_animPlaying;
+            AnimSetPlaying(false);
+            SetCapture(hwnd);
+            AnimShowFrame(AnimFrameAtX(pt.x, rc.right, rc.bottom));
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        if (g_animScrubbing) {
+            AnimShowFrame(AnimFrameAtX(pt.x, rc.right, rc.bottom));
+            return 0;
+        }
+        int hot = -1;
+        if (!g_animEdited)
+            for (int b = 0; b < ABTN_COUNT; b++) { RECT r = AnimButtonRect(b, rc.bottom); if (PtInRect(&r, pt)) hot = b; }
+        if (hot != g_animHot) {
+            g_animHot = hot;
+            InvalidateRect(hwnd, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_animHot = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (g_animScrubbing) {
+            g_animScrubbing = false;
+            ReleaseCapture();
+            if (g_animWasPlaying) AnimSetPlaying(true);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        g_animScrubbing = false;
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
 // ============================================================
 //  Layout
 // ============================================================
@@ -13562,13 +14251,17 @@ static void LayoutCanvasAndFolderBrowser(HWND hwndMain)
     bool showStrip = g_showFolderBrowser && g_hwndFolderBrowser;
     int stripH  = showStrip ? ClampFolderBrowserH(g_folderBrowserH) : 0;
     int canvasY = TOOLBAR_HEIGHT + COLORSTRIP_H;
-    int canvasH = max(0, H - canvasY - statusH - stripH);
+    int barH    = (g_animActive && g_hwndAnimBar) ? ANIM_BAR_H : 0;
+    int canvasH = max(0, H - canvasY - statusH - stripH - barH);
 
     // The search panel, when open, takes the left end of the strip's row
     int searchW = (showStrip && g_folderSearchOpen && g_hwndFolderSearch) ? min(FOLDER_SEARCH_W, W / 2) : 0;
 
     // Move them in one step so the gaps between them never show
-    HDWP dwp = BeginDeferWindowPos(3);
+    HDWP dwp = BeginDeferWindowPos(4);
+    if (dwp && barH)
+        dwp = DeferWindowPos(dwp, g_hwndAnimBar, NULL, 0, H - statusH - stripH - barH, W, barH,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && searchW)
         dwp = DeferWindowPos(dwp, g_hwndFolderSearch, NULL, 0, H - statusH - stripH, searchW, stripH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
@@ -15094,6 +15787,13 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                 0, 0, FOLDER_SEARCH_W, FOLDER_BROWSER_H, hwnd, nullptr, GetModuleHandle(NULL), NULL);
             // shown by Ctrl+F
+
+            wcs.lpfnWndProc   = AnimBarWndProc;
+            wcs.lpszClassName = L"MyPaintAnimBar";
+            RegisterClassEx(&wcs);
+            g_hwndAnimBar = CreateWindowEx(0, L"MyPaintAnimBar", NULL, WS_CHILD | WS_CLIPSIBLINGS,
+                0, 0, 0, ANIM_BAR_H, hwnd, nullptr, GetModuleHandle(NULL), NULL);
+            // shown for animated files
         }
 
         // Register canvas class
@@ -15502,6 +16202,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_IMAGE_LOADED:
         FinishImageLoad((AsyncImageLoad*)lParam);
+        return 0;
+
+    case WM_FOLDER_CHANGED:
+        RefreshFolderListFromDisk();
+        return 0;
+
+    case WM_ANIM_FRAME:
+        AnimOnFrameMessage((AnimFrameMsg*)lParam);
         return 0;
 
     case WM_DROPFILES: {
@@ -16310,6 +17018,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
         }
         if (g_hwndHelp && IsDialogMessage(g_hwndHelp, &msg))
             continue;
+        if (AnimHandleKey(msg)) continue;
         // Ctrl+C, Ctrl+V, Ctrl+A etc. in the strip's text boxes edit the text,
         // not the image; Ctrl+F still reaches the search
         bool inStripEdit = msg.hwnd && (msg.hwnd == g_hwndFolderSearchEdit || msg.hwnd == g_hwndFolderRename) &&
