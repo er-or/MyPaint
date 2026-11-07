@@ -54,6 +54,17 @@
 #define ID_SORT_TYPE            40614
 #define ID_SORT_ASC             40615
 #define ID_SORT_DESC            40616
+// Layers
+#define ID_LAYER_ADD             40620
+#define ID_LAYER_DELETE          40621
+#define ID_LAYER_DUPLICATE       40622
+#define ID_LAYER_MOVE_UP          40623
+#define ID_LAYER_MOVE_DOWN        40624
+#define ID_LAYER_MERGE_DOWN       40625
+#define ID_LAYER_ACTIVATE_UP      40626
+#define ID_LAYER_ACTIVATE_DOWN    40627
+#define ID_LAYER_TOGGLE_VISIBLE   40628
+#define ID_LAYER_OPACITY          40629   // percent in HIWORD(wParam)
 
 // Toolbar menu-bar replacement button IDs
 #define ID_MENU_FILE            40801

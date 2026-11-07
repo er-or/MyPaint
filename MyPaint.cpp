@@ -344,9 +344,32 @@ static int  g_canvasOffY = 0;
 // Current file
 static wchar_t g_currentFile[MAX_PATH] = L"";
 
-// Undo / redo stacks
-static std::vector<Bitmap*> g_undoStack;
-static std::vector<Bitmap*> g_redoStack;
+// Layers, bottom first. g_pCanvas is always the active layer's bitmap, so the
+// drawing tools just draw on g_pCanvas; that layer's own bmp is null while it is
+// active (see LayerBitmap). Anything that needs the whole picture uses
+// FlattenedCanvas. A layer holds pixels for now; other content (SVG, editable
+// shapes) is meant to join behind this struct, rendering into bmp.
+struct Layer {
+    std::wstring name;
+    Bitmap* bmp = nullptr;
+    bool    visible = true;
+    int     opacity = 100;   // percent
+};
+static std::vector<Layer> g_layers;
+static int g_activeLayer = 0;
+static int g_layerNameCounter = 1;           // for the next "Layer N"
+
+// Undo / redo. An edit to one layer saves that layer's pixels; anything that
+// changes the layer list or every layer's size saves the whole document.
+struct UndoEntry {
+    int     layer = -1;           // >= 0: the pixels of this layer, in bmp
+    Bitmap* bmp = nullptr;
+    std::vector<Layer> doc;       // layer == -1: all the layers (every bmp set)
+    int     docActive = 0;
+    ~UndoEntry() { delete bmp; for (auto& l : doc) delete l.bmp; }
+};
+static std::vector<UndoEntry*> g_undoStack;
+static std::vector<UndoEntry*> g_redoStack;
 
 // Custom colours for ChooseColor
 static COLORREF g_customColors[16] = {};
@@ -748,6 +771,10 @@ static void CommitShape();
 static void CancelShape();
 static void CommitTextInline();
 static void CancelTextInline();
+static Bitmap* FlattenedCanvas();
+static void PushUndoDocument();
+static void DropLastUndo();
+static void ClearUndoHistory();
 static bool IsTextBoxInterior(float canX, float canY);
 static void PlaceCaretAtCanvasPoint(float canX, float canY);
 static POINT ClientToCanvas(HWND hwnd, int cx, int cy);
@@ -769,6 +796,8 @@ static inline BYTE BgAlphaByte() { return (BYTE)(g_bgAlpha * 255 / 100); }
 // ============================================================
 //  Canvas helpers
 // ============================================================
+static void ResetToOneLayer();
+
 static void CreateCanvas(int w, int h, bool white)
 {
     DestroyCanvas();
@@ -786,6 +815,19 @@ static void CreateCanvas(int w, int h, bool white)
     Graphics gfxPrev(g_pPreview);
     gfxPrev.Clear(Color(0, 0, 0, 0));
     g_previewUsed = false;
+    ResetToOneLayer();
+}
+
+// The document becomes one layer: g_pCanvas. Frees any other layers.
+static void ResetToOneLayer()
+{
+    for (auto& l : g_layers) delete l.bmp;
+    g_layers.clear();
+    Layer base;
+    base.name = L"Layer 1";
+    g_layers.push_back(base);
+    g_activeLayer = 0;
+    g_layerNameCounter = 2;
 }
 
 static void DestroyCanvas()
@@ -793,6 +835,81 @@ static void DestroyCanvas()
     delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
     delete g_pCanvas;    g_pCanvas    = nullptr;
     delete g_pPreview;   g_pPreview   = nullptr;
+    for (auto& l : g_layers) delete l.bmp;
+    g_layers.clear();
+}
+
+static Bitmap* LayerBitmap(int i) { return i == g_activeLayer ? g_pCanvas : g_layers[i].bmp; }
+
+static Bitmap* CloneWholeBitmap(Bitmap* b)
+{
+    return b->Clone(0, 0, (INT)b->GetWidth(), (INT)b->GetHeight(), PixelFormat32bppARGB);
+}
+
+static void RebindCanvasGraphics()
+{
+    delete g_pGfxCanvas;
+    g_pGfxCanvas = Graphics::FromImage(g_pCanvas);
+    g_pGfxCanvas->SetSmoothingMode(SmoothingModeAntiAlias);
+    g_pGfxCanvas->SetTextRenderingHint(TextRenderingHintAntiAlias);
+}
+
+// Moves g_pCanvas to another layer; the caller rebinds g_pGfxCanvas
+static void SwapActiveLayer(int i)
+{
+    if (i == g_activeLayer) return;
+    g_layers[g_activeLayer].bmp = g_pCanvas;
+    g_pCanvas = g_layers[i].bmp;
+    g_layers[i].bmp = nullptr;
+    g_activeLayer = i;
+}
+
+// Replaces every layer's bitmap with make(old bitmap), for rotate, flip, crop
+// and resize. All the new ones are made first, so running out of memory leaves
+// the document as it was. The caller has saved undo.
+template <typename F>
+static bool ReplaceLayerBitmaps(int w, int h, F make)
+{
+    std::vector<Bitmap*> fresh;
+    Bitmap* preview = new Bitmap(w, h, PixelFormat32bppARGB);
+    bool ok = preview->GetLastStatus() == Ok;
+    for (int i = 0; ok && i < (int)g_layers.size(); i++) {
+        Bitmap* b = make(LayerBitmap(i));
+        ok = b && b->GetLastStatus() == Ok;
+        fresh.push_back(b);
+    }
+    if (!ok) {
+        delete preview;
+        for (auto* b : fresh) delete b;
+        MessageBox(g_hwndMain, L"Not enough memory for this.", APP_TITLE, MB_ICONERROR);
+        return false;
+    }
+    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
+    delete g_pCanvas;
+    delete g_pPreview;
+    for (int i = 0; i < (int)g_layers.size(); i++) {
+        delete g_layers[i].bmp;
+        g_layers[i].bmp = i == g_activeLayer ? nullptr : fresh[i];
+    }
+    g_pCanvas  = fresh[g_activeLayer];
+    g_pPreview = preview;
+    { Graphics gp(g_pPreview); gp.Clear(Color(0, 0, 0, 0)); }
+    g_previewUsed = false;
+    RebindCanvasGraphics();
+    return true;
+}
+
+// A new w x h transparent bitmap with draw(graphics) done on it
+template <typename F>
+static Bitmap* NewLayerBitmap(int w, int h, F draw)
+{
+    Bitmap* b = new Bitmap(w, h, PixelFormat32bppARGB);
+    if (b->GetLastStatus() == Ok) {
+        Graphics g(b);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        draw(g);
+    }
+    return b;
 }
 
 // An open SVG is displayed from a fresh render of the file. Once the canvas is
@@ -804,22 +921,117 @@ static void LeaveSvgDisplay()
     delete g_svgDisplayBitmap; g_svgDisplayBitmap = nullptr;
 }
 
+static UndoEntry* SnapshotLayer(int i)
+{
+    Bitmap* b = CloneWholeBitmap(LayerBitmap(i));
+    if (!b) return nullptr;
+    auto* e = new UndoEntry();
+    e->layer = i;
+    e->bmp = b;
+    return e;
+}
+
+static UndoEntry* SnapshotDocument()
+{
+    auto* e = new UndoEntry();
+    e->docActive = g_activeLayer;
+    for (int i = 0; i < (int)g_layers.size(); i++) {
+        Layer l = g_layers[i];
+        l.bmp = CloneWholeBitmap(LayerBitmap(i));
+        if (!l.bmp) { delete e; return nullptr; }
+        e->doc.push_back(l);
+    }
+    return e;
+}
+
+static void PushOntoStack(std::vector<UndoEntry*>& stack, UndoEntry* e)
+{
+    if (!e) return;
+    stack.push_back(e);
+    while ((int)stack.size() > MAX_UNDO) {
+        delete stack.front();
+        stack.erase(stack.begin());
+    }
+}
+
+static void ClearStack(std::vector<UndoEntry*>& stack)
+{
+    for (auto* e : stack) delete e;
+    stack.clear();
+}
+
+static void ClearUndoHistory()
+{
+    ClearStack(g_undoStack);
+    ClearStack(g_redoStack);
+}
+
+// Takes back the entry just pushed, when the edit it was for came to nothing
+static void DropLastUndo()
+{
+    if (g_undoStack.empty()) return;
+    delete g_undoStack.back();
+    g_undoStack.pop_back();
+}
+
 static void PushUndo()
 {
     if (!g_pCanvas) return;
     LeaveSvgDisplay();   // every edit starts here
     AnimLeaveForEdit();
     // Clear redo — new drawing action invalidates the redo history
-    for (auto* b : g_redoStack) delete b;
-    g_redoStack.clear();
-    Bitmap* snap = g_pCanvas->Clone(0, 0,
-        (INT)g_pCanvas->GetWidth(), (INT)g_pCanvas->GetHeight(),
-        PixelFormat32bppARGB);
-    g_undoStack.push_back(snap);
-    while ((int)g_undoStack.size() > MAX_UNDO) {
-        delete g_undoStack.front();
-        g_undoStack.erase(g_undoStack.begin());
+    ClearStack(g_redoStack);
+    PushOntoStack(g_undoStack, SnapshotLayer(g_activeLayer));
+}
+
+// For edits that change the layer list or every layer's size
+static void PushUndoDocument()
+{
+    if (!g_pCanvas) return;
+    LeaveSvgDisplay();
+    AnimLeaveForEdit();
+    ClearStack(g_redoStack);
+    PushOntoStack(g_undoStack, SnapshotDocument());
+}
+
+// Puts the document back as e recorded it, and deletes e
+static void RestoreUndoEntry(UndoEntry* e)
+{
+    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
+    if (e->layer >= 0) {
+        SwapActiveLayer(e->layer);   // show the layer being changed
+        delete g_pCanvas;
+        g_pCanvas = e->bmp;
+        e->bmp = nullptr;
+    } else {
+        delete g_pCanvas;
+        for (auto& l : g_layers) delete l.bmp;
+        g_layers.swap(e->doc);
+        e->doc.clear();
+        g_activeLayer = e->docActive;
+        g_pCanvas = g_layers[g_activeLayer].bmp;
+        g_layers[g_activeLayer].bmp = nullptr;
     }
+    delete e;
+
+    int w = (int)g_pCanvas->GetWidth();
+    int h = (int)g_pCanvas->GetHeight();
+    if (!g_pPreview ||
+        (int)g_pPreview->GetWidth()  != w ||
+        (int)g_pPreview->GetHeight() != h)
+    {
+        delete g_pPreview;
+        g_pPreview = new Bitmap(w, h, PixelFormat32bppARGB);
+    }
+    { Graphics gp(g_pPreview); gp.Clear(Color(0,0,0,0)); }
+    RebindCanvasGraphics();
+    StopMarchingAnts(); g_hasSelMask = false;
+    g_hasSelection = false;
+    InvalidateCanvas();
+    g_modified = true;
+    UpdateTitleBar();
+    UpdateStatusBar(0, 0);
+    UpdateScrollBars();
 }
 
 static void PopUndo()
@@ -830,84 +1042,21 @@ static void PopUndo()
     if (g_isPasting)   CancelPaste();
     if (g_selFloating) { delete g_selFloatBitmap; g_selFloatBitmap = nullptr; g_selFloating = false; }
     g_selDragMode = 0;
-    // Save current state to redo before reverting
-    if (g_pCanvas) {
-        Bitmap* cur = g_pCanvas->Clone(0, 0,
-            (INT)g_pCanvas->GetWidth(), (INT)g_pCanvas->GetHeight(),
-            PixelFormat32bppARGB);
-        if (cur) {
-            g_redoStack.push_back(cur);
-            while ((int)g_redoStack.size() > MAX_UNDO) {
-                delete g_redoStack.front();
-                g_redoStack.erase(g_redoStack.begin());
-            }
-        }
-    }
-    Bitmap* prev = g_undoStack.back();
+    UndoEntry* prev = g_undoStack.back();
     g_undoStack.pop_back();
-
-    int w = (int)prev->GetWidth();
-    int h = (int)prev->GetHeight();
-    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
-    g_pCanvas = prev;
-    if (!g_pPreview ||
-        (int)g_pPreview->GetWidth()  != w ||
-        (int)g_pPreview->GetHeight() != h)
-    {
-        delete g_pPreview;
-        g_pPreview = new Bitmap(w, h, PixelFormat32bppARGB);
-    }
-    Graphics gp(g_pPreview); gp.Clear(Color(0,0,0,0));
-    g_pGfxCanvas = Graphics::FromImage(g_pCanvas);
-    g_pGfxCanvas->SetSmoothingMode(SmoothingModeAntiAlias);
-    g_pGfxCanvas->SetTextRenderingHint(TextRenderingHintAntiAlias);
-    StopMarchingAnts(); g_hasSelMask = false;
-    g_hasSelection = false;
-    InvalidateCanvas();
-    g_modified = true;
-    UpdateTitleBar();
-    UpdateStatusBar(0, 0);
-    UpdateScrollBars();
+    // Save the current state of the same thing to redo before reverting
+    PushOntoStack(g_redoStack, prev->layer >= 0 ? SnapshotLayer(prev->layer) : SnapshotDocument());
+    RestoreUndoEntry(prev);
 }
 
 static void DoRedo()
 {
     if (g_redoStack.empty()) { MessageBeep(MB_ICONEXCLAMATION); return; }
-    // Push current state to undo (without touching the redo stack)
-    if (g_pCanvas) {
-        Bitmap* snap = g_pCanvas->Clone(0, 0,
-            (INT)g_pCanvas->GetWidth(), (INT)g_pCanvas->GetHeight(),
-            PixelFormat32bppARGB);
-        if (snap) {
-            g_undoStack.push_back(snap);
-            while ((int)g_undoStack.size() > MAX_UNDO) {
-                delete g_undoStack.front();
-                g_undoStack.erase(g_undoStack.begin());
-            }
-        }
-    }
-    Bitmap* next = g_redoStack.back();
+    UndoEntry* next = g_redoStack.back();
     g_redoStack.pop_back();
-    int w = (int)next->GetWidth(), h = (int)next->GetHeight();
-    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
-    g_pCanvas = next;
-    if (!g_pPreview || (int)g_pPreview->GetWidth() != w || (int)g_pPreview->GetHeight() != h) {
-        delete g_pPreview;
-        g_pPreview = new Bitmap(w, h, PixelFormat32bppARGB);
-    }
-    { Graphics gp(g_pPreview); gp.Clear(Color(0,0,0,0)); }
-    g_pGfxCanvas = Graphics::FromImage(g_pCanvas);
-    g_pGfxCanvas->SetSmoothingMode(SmoothingModeAntiAlias);
-    g_pGfxCanvas->SetTextRenderingHint(TextRenderingHintAntiAlias);
-    StopMarchingAnts(); g_hasSelMask = false;
-    g_hasSelection = false;
-    g_modified = true;
-    UpdateTitleBar();
-    UpdateStatusBar(0, 0);
-    InvalidateCanvas();
-    UpdateScrollBars();
+    // Push the current state to undo (without touching the redo stack)
+    PushOntoStack(g_undoStack, next->layer >= 0 ? SnapshotLayer(next->layer) : SnapshotDocument());
+    RestoreUndoEntry(next);
 }
 
 // Every canvas change repaints through InvalidateCanvas, which bumps this so
@@ -926,6 +1075,48 @@ static void InvalidateCanvas()
 static void InvalidateCanvasView()
 {
     if (g_hwndCanvas) InvalidateRect(g_hwndCanvas, NULL, FALSE);
+}
+
+// The whole picture: every visible layer drawn in order. One plain layer is
+// simply g_pCanvas; otherwise this is a copy, remade when the canvas has changed.
+static Bitmap*  g_flatBitmap  = nullptr;
+static unsigned g_flatVersion = 0;
+
+static Bitmap* FlattenedCanvas()
+{
+    if (!g_pCanvas) return nullptr;
+    if (g_layers.size() <= 1 && (g_layers.empty() || (g_layers[0].visible && g_layers[0].opacity >= 100))) {
+        delete g_flatBitmap; g_flatBitmap = nullptr;
+        return g_pCanvas;
+    }
+    int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
+    if (g_flatBitmap && g_flatVersion == g_canvasVersion &&
+        (int)g_flatBitmap->GetWidth() == w && (int)g_flatBitmap->GetHeight() == h)
+        return g_flatBitmap;
+    delete g_flatBitmap;
+    g_flatBitmap = new Bitmap(w, h, PixelFormat32bppARGB);
+    if (g_flatBitmap->GetLastStatus() != Ok) {   // out of memory: show at least the active layer
+        delete g_flatBitmap; g_flatBitmap = nullptr;
+        return g_pCanvas;
+    }
+    g_flatVersion = g_canvasVersion;
+    Graphics g(g_flatBitmap);
+    g.SetCompositingMode(CompositingModeSourceOver);
+    g.SetInterpolationMode(InterpolationModeNearestNeighbor);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    Rect dest(0, 0, w, h);
+    for (int i = 0; i < (int)g_layers.size(); i++) {
+        if (!g_layers[i].visible || g_layers[i].opacity <= 0) continue;
+        if (g_layers[i].opacity >= 100) {
+            g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel);
+        } else {
+            ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,g_layers[i].opacity / 100.0f,0, 0,0,0,0,1 };
+            ImageAttributes ia;
+            ia.SetColorMatrix(&cm);
+            g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel, &ia);
+        }
+    }
+    return g_flatBitmap;
 }
 
 // File being loaded in the background; the title shows it straight away
@@ -1000,7 +1191,7 @@ static void UpdateStatusBar(int canvasX, int canvasY)
         canvasY < (int)g_pCanvas->GetHeight())
     {
         Color c;
-        g_pCanvas->GetPixel(canvasX, canvasY, &c);
+        FlattenedCanvas()->GetPixel(canvasX, canvasY, &c);
         StringCchPrintf(buf, 64, L" RGB(%d,%d,%d)", (int)c.GetR(), (int)c.GetG(), (int)c.GetB());
         SetStatusText(STATUS_PANE_COLOR, buf);
         StringCchPrintf(buf, 64, L" #%02X%02X%02X", (int)c.GetR(), (int)c.GetG(), (int)c.GetB());
@@ -1069,8 +1260,7 @@ static bool PromptSaveIfNeeded()
 static void DoNew()
 {
     if (!PromptSaveIfNeeded()) return;
-    for (auto* b : g_undoStack) delete b; g_undoStack.clear();
-    for (auto* b : g_redoStack) delete b; g_redoStack.clear();
+    ClearUndoHistory();
     CancelPaste();
     g_hasSelection = false;
     AnimStop();
@@ -1532,7 +1722,7 @@ static bool SavePngFile(Bitmap* bmp, const wchar_t* file)
 
 static bool SaveWebP(const wchar_t* file)
 {
-    return g_pCanvas && SaveWebPBitmap(g_pCanvas, file);
+    return g_pCanvas && SaveWebPBitmap(FlattenedCanvas(), file);
 }
 
 // Rasterise an SVG file to a pixel buffer.
@@ -1804,11 +1994,11 @@ static void InstallCanvasImage(Bitmap* bmp, const wchar_t* file, bool isSVG, boo
     delete g_svgDisplayBitmap; g_svgDisplayBitmap = nullptr;
     g_isSvgFile = isSVG;
     g_svgCanvasScale = isSVG ? svgScale : 1.0f;
-    for (auto* b : g_undoStack) delete b; g_undoStack.clear();
-    for (auto* b : g_redoStack) delete b; g_redoStack.clear();
+    ClearUndoHistory();
     CancelPaste();
     g_hasSelection = false;
     delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
+    ResetToOneLayer();
     delete g_pCanvas;
     delete g_pPreview;
     g_pCanvas = canvas;
@@ -2006,13 +2196,13 @@ static void SaveToFile(const wchar_t* filepath)
     if (isWebP) {
         ok = SaveWebP(filepath);
     } else if (isJpeg) {
-        ok = SaveJpeg(g_pCanvas, g_jpegQuality, filepath);
+        ok = SaveJpeg(FlattenedCanvas(), g_jpegQuality, filepath);
     } else if (dot && _wcsicmp(dot + 1, L"png") == 0) {
-        ok = SavePngFile(g_pCanvas, filepath);
+        ok = SavePngFile(FlattenedCanvas(), filepath);
     } else {
         CLSID enc;
         if (!GetSaveEncoder(filepath, enc)) GetEncoderClsid(L"image/png", &enc);
-        ok = (g_pCanvas->Save(filepath, &enc) == Ok);
+        ok = (FlattenedCanvas()->Save(filepath, &enc) == Ok);
     }
     SetCursor(oldCursor);
 
@@ -2293,7 +2483,7 @@ static void DoSaveOptions()
         Graphics g(d.sample);
         g.SetCompositingMode(CompositingModeSourceCopy);   // keep transparency as is
         g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
-        g.DrawImage(g_pCanvas, 0, 0, sw, sh);
+        g.DrawImage(FlattenedCanvas(), 0, 0, sw, sh);
     }
     d.sampleScale = px / ((double)sw * sh);
     if (!g_hDarkBgBrush && g_darkMode) g_hDarkBgBrush = CreateSolidBrush(RGB(45, 45, 48));
@@ -2375,7 +2565,7 @@ static void DoPrint()
     if (StartDocW(hPrn, &di) > 0) {
         StartPage(hPrn);
         Graphics g(hPrn);
-        g.DrawImage(g_pCanvas, dx, dy, dw, dh);
+        g.DrawImage(FlattenedCanvas(), dx, dy, dw, dh);
         EndPage(hPrn);
         EndDoc(hPrn);
     }
@@ -6449,7 +6639,7 @@ static void DoCopy()
         // Nothing selected: copy the whole image, as most editors do
         if (OpenClipboard(g_hwndMain)) {
             EmptyClipboard();
-            ClipboardPutBitmap(g_pCanvas);
+            ClipboardPutBitmap(FlattenedCanvas());
             CloseClipboard();
         }
         return;
@@ -6646,10 +6836,7 @@ static void CancelSelectionFloat()
     g_selFloating   = false;
     g_selFloatAngle = 0.0f;
     // Silently remove the undo entry pushed at extraction time
-    if (!g_undoStack.empty()) {
-        delete g_undoStack.back();
-        g_undoStack.pop_back();
-    }
+    DropLastUndo();
     g_selRect      = g_selFloatOrigRect;
     g_hasSelection = true;
     InvalidateCanvas();
@@ -6720,21 +6907,11 @@ static void DoPaste()
         int newW = max(cw, pw);
         int newH = max(ch, ph);
         if (newW > cw || newH > ch) {
-            PushUndo();
+            PushUndoDocument();
             g_pasteDidResize = true;
-            Bitmap*   newBmp = new Bitmap(newW, newH, PixelFormat32bppARGB);
-            Graphics* newGfx = Graphics::FromImage(newBmp);
-            newGfx->SetSmoothingMode(SmoothingModeAntiAlias);
-            newGfx->SetTextRenderingHint(TextRenderingHintAntiAlias);
-            newGfx->Clear(Color(0, 0, 0, 0));
-            newGfx->DrawImage(g_pCanvas, 0, 0);
-            delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-            delete g_pCanvas;
-            delete g_pPreview;
-            g_pCanvas    = newBmp;
-            g_pGfxCanvas = newGfx;
-            g_pPreview   = new Bitmap(newW, newH, PixelFormat32bppARGB);
-            { Graphics gp(g_pPreview); gp.Clear(Color(0,0,0,0)); }
+            ReplaceLayerBitmaps(newW, newH, [&](Bitmap* src) {
+                return NewLayerBitmap(newW, newH, [&](Graphics& g) { g.DrawImage(src, 0, 0, cw, ch); });
+            });
             g_modified = true;
             UpdateTitleBar();
             UpdateScrollBars();
@@ -6903,30 +7080,18 @@ static void DoResizeCanvas()
     int newW = g_resizeDlgData.width;
     int newH = g_resizeDlgData.height;
 
-    PushUndo();
+    PushUndoDocument();
 
-    Bitmap*   newBmp = new Bitmap(newW, newH, PixelFormat32bppARGB);
-    Graphics* newGfx = Graphics::FromImage(newBmp);
-    newGfx->SetSmoothingMode(SmoothingModeAntiAlias);
-    newGfx->SetInterpolationMode(InterpolationModeHighQualityBicubic);
-    newGfx->SetTextRenderingHint(TextRenderingHintAntiAlias);
-    newGfx->Clear(Color(0, 0, 0, 0));
-
-    if (g_resizeDlgData.canvasOnly) {
-        // Canvas only: blit existing image at top-left without scaling
-        newGfx->DrawImage(g_pCanvas, 0, 0);
-    } else {
-        // Resize image: scale to fill the new dimensions
-        newGfx->DrawImage(g_pCanvas, 0, 0, newW, newH);
-    }
-
-    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
-    delete g_pPreview;
-    g_pCanvas    = newBmp;
-    g_pGfxCanvas = newGfx;
-    g_pPreview   = new Bitmap(newW, newH, PixelFormat32bppARGB);
-    { Graphics gp(g_pPreview); gp.Clear(Color(0,0,0,0)); }
+    bool canvasOnly = g_resizeDlgData.canvasOnly != 0;
+    if (!ReplaceLayerBitmaps(newW, newH, [&](Bitmap* src) {
+            return NewLayerBitmap(newW, newH, [&](Graphics& g) {
+                g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+                // Canvas only: existing image at top-left without scaling.
+                // Resize image: scale to fill the new dimensions.
+                if (canvasOnly) g.DrawImage(src, 0, 0, curW, curH);
+                else            g.DrawImage(src, 0, 0, newW, newH);
+            });
+        })) { DropLastUndo(); return; }
 
     g_hasSelection = false;
     g_modified = true;
@@ -7017,28 +7182,19 @@ static void DoRotateCanvas(bool clockwise)
 
     // ── No selection: rotate entire canvas ───────────────────────────────
     StopMarchingAnts();
-    PushUndo();
+    PushUndoDocument();
     INT srcW = (INT)g_pCanvas->GetWidth();
     INT srcH = (INT)g_pCanvas->GetHeight();
     INT dstW = srcH, dstH = srcW;
-    Bitmap*   newBmp = new Bitmap(dstW, dstH, PixelFormat32bppARGB);
-    Graphics* newGfx = Graphics::FromImage(newBmp);
-    newGfx->SetSmoothingMode(SmoothingModeAntiAlias);
-    newGfx->SetTextRenderingHint(TextRenderingHintAntiAlias);
-    newGfx->Clear(Color(0, 0, 0, 0));
-    Matrix m;
-    if (clockwise) { m.Translate((REAL)srcH, 0.0f); m.Rotate(90.0f); }
-    else           { m.Translate(0.0f, (REAL)srcW); m.Rotate(-90.0f); }
-    newGfx->SetTransform(&m);
-    newGfx->DrawImage(g_pCanvas, 0, 0, srcW, srcH);
-    newGfx->ResetTransform();
-    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
-    delete g_pPreview;
-    g_pCanvas    = newBmp;
-    g_pGfxCanvas = newGfx;
-    g_pPreview   = new Bitmap(dstW, dstH, PixelFormat32bppARGB);
-    { Graphics gp(g_pPreview); gp.Clear(Color(0, 0, 0, 0)); }
+    if (!ReplaceLayerBitmaps(dstW, dstH, [&](Bitmap* src) {
+            return NewLayerBitmap(dstW, dstH, [&](Graphics& g) {
+                Matrix m;
+                if (clockwise) { m.Translate((REAL)srcH, 0.0f); m.Rotate(90.0f); }
+                else           { m.Translate(0.0f, (REAL)srcW); m.Rotate(-90.0f); }
+                g.SetTransform(&m);
+                g.DrawImage(src, 0, 0, srcW, srcH);
+            });
+        })) { DropLastUndo(); return; }
     g_hasSelection = false;
     g_modified = true;
     InvalidateCanvas();
@@ -7061,20 +7217,10 @@ static void DoCropToSelection()
     if (w <= 0 || h <= 0) return;
 
     StopMarchingAnts();
-    PushUndo();
-    Bitmap* newBmp = g_pCanvas->Clone(r.left, r.top, w, h, PixelFormat32bppARGB);
-    if (!newBmp || newBmp->GetLastStatus() != Ok) { delete newBmp; return; }
-    Graphics* newGfx = Graphics::FromImage(newBmp);
-    newGfx->SetSmoothingMode(SmoothingModeAntiAlias);
-    newGfx->SetTextRenderingHint(TextRenderingHintAntiAlias);
-    delete g_pGfxCanvas;
-    delete g_pCanvas;
-    delete g_pPreview;
-    g_pCanvas    = newBmp;
-    g_pGfxCanvas = newGfx;
-    g_pPreview   = new Bitmap(w, h, PixelFormat32bppARGB);
-    { Graphics gp(g_pPreview); gp.Clear(Color(0, 0, 0, 0)); }
-    g_previewUsed  = false;
+    PushUndoDocument();
+    if (!ReplaceLayerBitmaps(w, h, [&](Bitmap* src) {
+            return src->Clone(r.left, r.top, w, h, PixelFormat32bppARGB);
+        })) { DropLastUndo(); return; }
     g_hasSelection = false;
     g_hasSelMask   = false;
     g_modified = true;
@@ -7155,27 +7301,18 @@ static void DoFlipCanvas(bool horizontal)
 
     // ── No selection: flip entire canvas ─────────────────────────────
     StopMarchingAnts();
-    PushUndo();
+    PushUndoDocument();
     INT w = (INT)g_pCanvas->GetWidth();
     INT h = (INT)g_pCanvas->GetHeight();
-    Bitmap*   newBmp = new Bitmap(w, h, PixelFormat32bppARGB);
-    Graphics* newGfx = Graphics::FromImage(newBmp);
-    newGfx->SetSmoothingMode(SmoothingModeAntiAlias);
-    newGfx->SetTextRenderingHint(TextRenderingHintAntiAlias);
-    newGfx->Clear(Color(0, 0, 0, 0));
-    Matrix m;
-    if (horizontal) { m.Translate((REAL)w, 0.0f); m.Scale(-1.0f, 1.0f); }
-    else            { m.Translate(0.0f, (REAL)h); m.Scale(1.0f, -1.0f); }
-    newGfx->SetTransform(&m);
-    newGfx->DrawImage(g_pCanvas, 0, 0, w, h);
-    newGfx->ResetTransform();
-    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
-    delete g_pPreview;
-    g_pCanvas    = newBmp;
-    g_pGfxCanvas = newGfx;
-    g_pPreview   = new Bitmap(w, h, PixelFormat32bppARGB);
-    { Graphics gp(g_pPreview); gp.Clear(Color(0, 0, 0, 0)); }
+    if (!ReplaceLayerBitmaps(w, h, [&](Bitmap* src) {
+            return NewLayerBitmap(w, h, [&](Graphics& g) {
+                Matrix m;
+                if (horizontal) { m.Translate((REAL)w, 0.0f); m.Scale(-1.0f, 1.0f); }
+                else            { m.Translate(0.0f, (REAL)h); m.Scale(1.0f, -1.0f); }
+                g.SetTransform(&m);
+                g.DrawImage(src, 0, 0, w, h);
+            });
+        })) { DropLastUndo(); return; }
     g_hasSelection = false;
     g_modified = true;
     InvalidateCanvas();
@@ -7945,17 +8082,18 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
             // Canvas + preview layer at zoom-scaled size
             // For SVGs, draw the pre-rasterized display bitmap 1:1 for crisp output
-            Bitmap* drawBmp = (g_isSvgFile && g_svgDisplayBitmap) ? g_svgDisplayBitmap : g_pCanvas;
+            Bitmap* flat = FlattenedCanvas();
+            Bitmap* drawBmp = (g_isSvgFile && g_svgDisplayBitmap) ? g_svgDisplayBitmap : flat;
             gfx.SetPixelOffsetMode(PixelOffsetModeHalf);
             // While an edit is under way the canvas changes every frame
             bool editing = GetCapture() == hwnd && g_currentTool != TOOL_HAND;
             bool drawn = false;
-            if (drawBmp == g_pCanvas && g_zoom < 1.0f && !editing &&
+            if (drawBmp == flat && g_zoom < 1.0f && !editing &&
                 (double)scaledW * scaledH <= 32.0 * 1024 * 1024) {
                 // Zoomed out: shrinking a big canvas with a high-quality filter
                 // takes far too long to redo every frame, so keep a shrunk copy
                 // and reuse it while the view only scrolls.
-                if (!g_zoomViewCache || g_zoomViewSrc != g_pCanvas || g_zoomViewVersion != g_canvasVersion ||
+                if (!g_zoomViewCache || g_zoomViewSrc != flat || g_zoomViewVersion != g_canvasVersion ||
                     (int)g_zoomViewCache->GetWidth() != scaledW || (int)g_zoomViewCache->GetHeight() != scaledH) {
                     delete g_zoomViewCache;
                     g_zoomViewCache = new Bitmap(scaledW, scaledH, PixelFormat32bppPARGB);
@@ -7964,8 +8102,8 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                         gc.SetCompositingMode(CompositingModeSourceCopy);
                         gc.SetInterpolationMode(InterpolationModeHighQualityBicubic);
                         gc.SetPixelOffsetMode(PixelOffsetModeHalf);
-                        gc.DrawImage(g_pCanvas, 0, 0, scaledW, scaledH);
-                        g_zoomViewSrc     = g_pCanvas;
+                        gc.DrawImage(flat, 0, 0, scaledW, scaledH);
+                        g_zoomViewSrc     = flat;
                         g_zoomViewVersion = g_canvasVersion;
                     } else {
                         delete g_zoomViewCache; g_zoomViewCache = nullptr;
@@ -8904,7 +9042,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 Gdiplus::Color px;
                 int sx = max(0, min((int)g_pCanvas->GetWidth()  - 1, (int)pt.x));
                 int sy = max(0, min((int)g_pCanvas->GetHeight() - 1, (int)pt.y));
-                g_pCanvas->GetPixel(sx, sy, &px);
+                FlattenedCanvas()->GetPixel(sx, sy, &px);   // what is seen, not just this layer
                 SetActiveColorFromPick(px.GetR(), px.GetG(), px.GetB(), px.GetA());
             }
             g_dropperCur = pt;
@@ -9603,29 +9741,23 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             if (g_canvasResizeDir & 2) newH = max(1, g_canvasResizeOrigH + (int)(dy / g_zoom));
             if (g_canvasResizeDir & 8) { newH = max(1, g_canvasResizeOrigH - (int)(dy / g_zoom)); drawOffY = newH - g_canvasResizeOrigH; }
             if (newW != g_canvasResizeOrigW || newH != g_canvasResizeOrigH) {
-                PushUndo();
-                Bitmap*   newBmp = new Bitmap(newW, newH, PixelFormat32bppARGB);
-                Graphics* newGfx = Graphics::FromImage(newBmp);
-                newGfx->SetSmoothingMode(SmoothingModeAntiAlias);
-                newGfx->SetTextRenderingHint(TextRenderingHintAntiAlias);
-                newGfx->Clear(Color(0, 0, 0, 0));
-                newGfx->DrawImage(g_pCanvas, drawOffX, drawOffY);
-                // Adjust scroll so existing content stays visually fixed after left/top expand
-                g_scrollX += (int)(drawOffX * g_zoom);
-                g_scrollY += (int)(drawOffY * g_zoom);
-                delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-                delete g_pCanvas;
-                delete g_pPreview;
-                g_pCanvas    = newBmp;
-                g_pGfxCanvas = newGfx;
-                g_pPreview   = new Bitmap(newW, newH, PixelFormat32bppARGB);
-                { Graphics gp(g_pPreview); gp.Clear(Color(0,0,0,0)); }
-                g_hasSelection = false;
-                g_modified = true;
-                UpdateTitleBar();
-                UpdateStatusBar(0, 0);
-                UpdateScrollBars();
-                InvalidateCanvas();
+                PushUndoDocument();
+                int oldW = g_canvasResizeOrigW, oldH = g_canvasResizeOrigH;
+                if (ReplaceLayerBitmaps(newW, newH, [&](Bitmap* src) {
+                        return NewLayerBitmap(newW, newH, [&](Graphics& g) { g.DrawImage(src, drawOffX, drawOffY, oldW, oldH); });
+                    })) {
+                    // Adjust scroll so existing content stays visually fixed after left/top expand
+                    g_scrollX += (int)(drawOffX * g_zoom);
+                    g_scrollY += (int)(drawOffY * g_zoom);
+                    g_hasSelection = false;
+                    g_modified = true;
+                    UpdateTitleBar();
+                    UpdateStatusBar(0, 0);
+                    UpdateScrollBars();
+                    InvalidateCanvas();
+                } else {
+                    DropLastUndo();
+                }
             }
             g_canvasResizeDir = 0;
             ReleaseCapture();
@@ -9672,7 +9804,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     for (int yy=y1d; yy<=y2d; ++yy)
                         for (int xx=x1d; xx<=x2d; ++xx) {
                             Gdiplus::Color px;
-                            g_pCanvas->GetPixel(xx, yy, &px);
+                            FlattenedCanvas()->GetPixel(xx, yy, &px);
                             rS+=px.GetR(); gS+=px.GetG(); bS+=px.GetB(); aS+=px.GetA(); ++n;
                         }
                     if (n) SetActiveColorFromPick((BYTE)(rS/n),(BYTE)(gS/n),(BYTE)(bS/n),(BYTE)(aS/n));
@@ -9712,7 +9844,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // Discard degenerate shapes produced by a click with no drag
             if (abs(pt.x - g_ptStart.x) < 2 && abs(pt.y - g_ptStart.y) < 2) {
                 ClearPreview();
-                if (!g_undoStack.empty()) { delete g_undoStack.back(); g_undoStack.pop_back(); }
+                DropLastUndo();
                 SetStatusText(STATUS_PANE_SEL, L"");
                 InvalidateCanvas();
                 break;
@@ -9751,7 +9883,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // Discard degenerate arrow produced by a click with no drag
             if (abs(pt.x - g_ptStart.x) < 2 && abs(pt.y - g_ptStart.y) < 2) {
                 ClearPreview();
-                if (!g_undoStack.empty()) { delete g_undoStack.back(); g_undoStack.pop_back(); }
+                DropLastUndo();
                 SetStatusText(STATUS_PANE_SEL, L"");
                 InvalidateCanvas();
                 break;
@@ -12247,10 +12379,7 @@ static void CancelShape()
     g_shapeEditFlipV = false;
     SetStatusText(STATUS_PANE_SEL, L"");
     // Silently remove the undo pushed at draw-start
-    if (!g_undoStack.empty()) {
-        delete g_undoStack.back();
-        g_undoStack.pop_back();
-    }
+    DropLastUndo();
     InvalidateCanvas();
 }
 
@@ -12526,7 +12655,7 @@ static Bitmap* LoadBitmapForCopy(const wchar_t* path)
 static void CopyImageFileToClipboard(const std::wstring& path)
 {
     bool isCur = _wcsicmp(path.c_str(), g_currentFile) == 0;
-    Bitmap* bmp = isCur ? g_pCanvas : LoadBitmapForCopy(path.c_str());
+    Bitmap* bmp = isCur ? FlattenedCanvas() : LoadBitmapForCopy(path.c_str());
     if (!bmp) { MessageBox(g_hwndMain, L"Could not read this image.", APP_TITLE, MB_ICONERROR); return; }
     if (OpenClipboard(g_hwndMain)) {
         EmptyClipboard();
@@ -13378,11 +13507,11 @@ static void FsFreeCache() { delete g_fsCache; g_fsCache = nullptr; g_fsCacheSrc 
 // Makes g_fsCache: the open image scaled to fit w × h
 static void FsBuildCache(int w, int h)
 {
-    if (g_fsCache && g_fsCacheSrc == g_pCanvas && g_fsCacheVersion == g_canvasVersion &&
+    if (g_fsCache && g_fsCacheSrc == FlattenedCanvas() && g_fsCacheVersion == g_canvasVersion &&
         g_fsCacheFor.cx == w && g_fsCacheFor.cy == h) return;
     FsFreeCache();
     if (!g_pCanvas || w <= 0 || h <= 0) return;
-    g_fsCacheSrc = g_pCanvas; g_fsCacheVersion = g_canvasVersion; g_fsCacheFor = { w, h };
+    g_fsCacheSrc = FlattenedCanvas(); g_fsCacheVersion = g_canvasVersion; g_fsCacheFor = { w, h };
     int cw = (int)g_pCanvas->GetWidth(), ch = (int)g_pCanvas->GetHeight();
     // An unedited SVG is drawn again at the size it is shown, so it stays sharp
     if (g_isSvgFile && !g_modified && g_currentFile[0] && g_svgCanvasScale > 0) {
@@ -13397,7 +13526,7 @@ static void FsBuildCache(int w, int h)
     Graphics g(g_fsCache);
     g.SetInterpolationMode(s < 1.0 ? InterpolationModeHighQualityBicubic : InterpolationModeHighQualityBilinear);
     g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-    g.DrawImage(g_pCanvas, 0, 0, dw, dh);
+    g.DrawImage(g_fsCacheSrc, 0, 0, dw, dh);
 }
 
 // Steps through the folder list: dir -1 / +1 wraps around; 0 with toEnd
@@ -13671,6 +13800,143 @@ static void ExitFullscreen()
         InvalidateRect(g_hwndFolderBrowser, NULL, TRUE);
         SetFocus(g_hwndFolderBrowser);
     } else if (g_hwndCanvas) SetFocus(g_hwndCanvas);
+}
+
+// ─── Layer operations ────────────────────────────────────────
+// Every one of these finishes anything still floating first, so it lands on the
+// layer it was started on.
+static void CommitFloatingEdits()
+{
+    if (g_textInline)   CommitTextInline();
+    if (g_shapeEditing) CommitShape();
+    if (g_bezEditing)   CommitBezier();
+    if (g_isPasting)    CommitPaste();
+    if (g_selFloating)  CommitSelectionFloat();
+}
+
+static void AfterLayerChange()
+{
+    g_modified = true;
+    InvalidateCanvas();
+    UpdateTitleBar();
+    UpdateStatusBar(0, 0);
+}
+
+// Puts a new layer above the active one and makes it active. Takes ownership of bmp.
+static void InsertLayerAboveActive(Bitmap* bmp, const std::wstring& name)
+{
+    Layer l;
+    l.name = name;
+    g_layers.insert(g_layers.begin() + g_activeLayer + 1, l);
+    g_layers[g_activeLayer].bmp = g_pCanvas;
+    g_activeLayer++;
+    g_pCanvas = bmp;
+    RebindCanvasGraphics();
+}
+
+static std::wstring NextLayerName() { return L"Layer " + std::to_wstring(g_layerNameCounter++); }
+
+static void LayerAdd()
+{
+    if (!g_pCanvas) return;
+    CommitFloatingEdits();
+    Bitmap* b = new Bitmap((INT)g_pCanvas->GetWidth(), (INT)g_pCanvas->GetHeight(), PixelFormat32bppARGB);
+    if (b->GetLastStatus() != Ok) { delete b; return; }
+    PushUndoDocument();
+    InsertLayerAboveActive(b, NextLayerName());
+    AfterLayerChange();
+}
+
+static void LayerDuplicate()
+{
+    if (!g_pCanvas) return;
+    CommitFloatingEdits();
+    Bitmap* b = CloneWholeBitmap(g_pCanvas);
+    if (!b) return;
+    PushUndoDocument();
+    Layer src = g_layers[g_activeLayer];
+    InsertLayerAboveActive(b, src.name + L" copy");
+    g_layers[g_activeLayer].visible = src.visible;
+    g_layers[g_activeLayer].opacity = src.opacity;
+    AfterLayerChange();
+}
+
+static void LayerDelete()
+{
+    if (!g_pCanvas || g_layers.size() < 2) { MessageBeep(MB_ICONEXCLAMATION); return; }
+    CommitFloatingEdits();
+    PushUndoDocument();
+    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
+    delete g_pCanvas;
+    g_layers.erase(g_layers.begin() + g_activeLayer);
+    g_activeLayer = min(g_activeLayer, (int)g_layers.size() - 1);
+    g_pCanvas = g_layers[g_activeLayer].bmp;
+    g_layers[g_activeLayer].bmp = nullptr;
+    RebindCanvasGraphics();
+    AfterLayerChange();
+}
+
+static void LayerMove(int dir)
+{
+    int to = g_activeLayer + dir;
+    if (!g_pCanvas || to < 0 || to >= (int)g_layers.size()) { MessageBeep(MB_ICONEXCLAMATION); return; }
+    CommitFloatingEdits();
+    PushUndoDocument();
+    std::swap(g_layers[g_activeLayer], g_layers[to]);
+    g_activeLayer = to;
+    AfterLayerChange();
+}
+
+// Draws the active layer onto the one below, at its opacity, and removes it
+static void LayerMergeDown()
+{
+    if (!g_pCanvas || g_activeLayer == 0) { MessageBeep(MB_ICONEXCLAMATION); return; }
+    CommitFloatingEdits();
+    PushUndoDocument();
+    Layer& below = g_layers[g_activeLayer - 1];
+    int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
+    if (g_layers[g_activeLayer].visible) {
+        Graphics g(below.bmp);
+        ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,g_layers[g_activeLayer].opacity / 100.0f,0, 0,0,0,0,1 };
+        ImageAttributes ia;
+        ia.SetColorMatrix(&cm);
+        g.SetInterpolationMode(InterpolationModeNearestNeighbor);
+        g.SetPixelOffsetMode(PixelOffsetModeHalf);
+        g.DrawImage(g_pCanvas, Rect(0, 0, w, h), 0, 0, w, h, UnitPixel, &ia);
+    }
+    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
+    delete g_pCanvas;
+    g_layers.erase(g_layers.begin() + g_activeLayer);
+    g_activeLayer--;
+    g_pCanvas = g_layers[g_activeLayer].bmp;
+    g_layers[g_activeLayer].bmp = nullptr;
+    RebindCanvasGraphics();
+    AfterLayerChange();
+}
+
+// The tools draw on whichever layer is active; this changes nothing to undo
+static void LayerSetActive(int i)
+{
+    if (!g_pCanvas || i < 0 || i >= (int)g_layers.size() || i == g_activeLayer) return;
+    CommitFloatingEdits();
+    delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
+    SwapActiveLayer(i);
+    RebindCanvasGraphics();
+    InvalidateCanvas();
+}
+
+static void LayerSetVisible(int i, bool visible)
+{
+    if (i < 0 || i >= (int)g_layers.size()) return;
+    g_layers[i].visible = visible;
+    AfterLayerChange();
+}
+
+static void LayerSetOpacity(int i, int percent)
+{
+    if (i < 0 || i >= (int)g_layers.size()) return;
+    g_layers[i].opacity = max(0, min(100, percent));
+    AfterLayerChange();
 }
 
 // ─── Animated GIF / WebP playback ────────────────────────────
@@ -16380,6 +16646,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_FOLDER_SEARCH:
             OpenFolderSearch();
             break;
+        case ID_LAYER_ADD:            LayerAdd();                  break;
+        case ID_LAYER_DELETE:         LayerDelete();               break;
+        case ID_LAYER_DUPLICATE:      LayerDuplicate();            break;
+        case ID_LAYER_MOVE_UP:        LayerMove(+1);               break;
+        case ID_LAYER_MOVE_DOWN:      LayerMove(-1);               break;
+        case ID_LAYER_MERGE_DOWN:     LayerMergeDown();            break;
+        case ID_LAYER_ACTIVATE_UP:    LayerSetActive(g_activeLayer + 1); break;
+        case ID_LAYER_ACTIVATE_DOWN:  LayerSetActive(g_activeLayer - 1); break;
+        case ID_LAYER_TOGGLE_VISIBLE: LayerSetVisible(g_activeLayer, !g_layers[g_activeLayer].visible); break;
+        case ID_LAYER_OPACITY:        LayerSetOpacity(g_activeLayer, HIWORD(wParam)); break;
         case ID_VIEW_FULLSCREEN:
             if (g_hwndFullscreen) ExitFullscreen(); else EnterFullscreen(false);
             break;
@@ -16880,10 +17156,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_hIcoMoon)       { DestroyIcon(g_hIcoMoon);            g_hIcoMoon       = NULL; }
         if (g_hIcoSun)        { DestroyIcon(g_hIcoSun);             g_hIcoSun        = NULL; }
         if (g_hIcoHelpBtn)    { DestroyIcon(g_hIcoHelpBtn);         g_hIcoHelpBtn    = NULL; }
-        for (auto* b : g_undoStack) delete b;
-        g_undoStack.clear();
-        for (auto* b : g_redoStack) delete b;
-        g_redoStack.clear();
+        ClearUndoHistory();
         g_shapeEditing = false;
         CancelPaste();
         delete g_selFloatBitmap; g_selFloatBitmap = nullptr;
