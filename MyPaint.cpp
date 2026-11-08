@@ -269,7 +269,7 @@ static HICON g_hIcoStatusCrop   = NULL;  // canvas size pane
 static HBITMAP g_hbmFileMenuIcons[8]  = {};
 static HBITMAP g_hbmEditMenuIcons[6]  = {};  // Undo, Redo, Cut, Copy, Paste, SelectAll
 static HBITMAP g_hbmImageMenuIcons[6] = {};  // RotateRight, RotateLeft, FlipH, FlipV, Crop, Resize
-static HBITMAP g_hbmViewMenuIcons[10] = {};  // one per kViewMenuEntries item
+static HBITMAP g_hbmViewMenuIcons[11] = {};  // one per kViewMenuEntries item
 
 // Pre-rendered opaque bitmaps for status bar icons — used in WM_DRAWITEM via BitBlt
 // so the icon draw is a single atomic GDI operation and never flickers.
@@ -349,24 +349,44 @@ static wchar_t g_currentFile[MAX_PATH] = L"";
 // active (see LayerBitmap). Anything that needs the whole picture uses
 // FlattenedCanvas. A layer holds pixels for now; other content (SVG, editable
 // shapes) is meant to join behind this struct, rendering into bmp.
+static unsigned g_layerUidCounter = 0;
 struct Layer {
     std::wstring name;
     Bitmap* bmp = nullptr;
     bool    visible = true;
     int     opacity = 100;   // percent
+    bool    locked = false;  // the tools and editing commands leave it alone
+    // Names these pixels for the cached combinations of layers (see FlatChunk).
+    // Made new whenever they may have changed: when the layer stops being the
+    // active one, comes back from undo, or is replaced. While active it may be stale.
+    unsigned uid = ++g_layerUidCounter;
 };
+static void LayerNewUid(Layer& l) { l.uid = ++g_layerUidCounter; }
 static std::vector<Layer> g_layers;
 static int g_activeLayer = 0;
 static int g_layerNameCounter = 1;           // for the next "Layer N"
+static bool g_layersSaveWarned = false;      // told that saving flattens this document's layers
 
-// Undo / redo. An edit to one layer saves that layer's pixels; anything that
-// changes the layer list or every layer's size saves the whole document.
+// Undo / redo. An edit to one layer saves that layer's pixels. Adding, removing
+// and moving a layer save only that, so they cost the same however many layers
+// there are. Changing every layer's size saves the whole document.
+enum UndoKind {
+    UNDO_PIXELS,     // put back the pixels of `layer`, from bmp
+    UNDO_DOCUMENT,   // put back every layer, from doc
+    UNDO_INSERT,     // put the layer `ins` back in at `index`
+    UNDO_REMOVE,     // take out the layer at `index`
+    UNDO_MOVE,       // move the layer at `index` to `to`
+};
 struct UndoEntry {
-    int     layer = -1;           // >= 0: the pixels of this layer, in bmp
-    Bitmap* bmp = nullptr;
-    std::vector<Layer> doc;       // layer == -1: all the layers (every bmp set)
+    UndoKind kind = UNDO_PIXELS;
+    int     layer = -1;           // UNDO_PIXELS, and optional with the layer list kinds
+    Bitmap* bmp = nullptr;        //   (then applied after the list is changed)
+    std::vector<Layer> doc;       // UNDO_DOCUMENT: all the layers (every bmp set)
     int     docActive = 0;
-    ~UndoEntry() { delete bmp; for (auto& l : doc) delete l.bmp; }
+    Layer   ins;                  // UNDO_INSERT, with its bmp
+    int     index = 0, to = 0;
+    int     active = 0;           // the layer list kinds: the active layer afterwards
+    ~UndoEntry() { delete bmp; delete ins.bmp; for (auto& l : doc) delete l.bmp; }
 };
 static std::vector<UndoEntry*> g_undoStack;
 static std::vector<UndoEntry*> g_redoStack;
@@ -484,6 +504,13 @@ static HWND  g_hwndFolderSearch     = NULL;   // search panel at the left end of
 static HWND  g_hwndAnimBar          = NULL;   // animation controls, above the strip
 static bool  g_animActive           = false;  // the open file is an animation: the bar is showing
 static const int ANIM_BAR_H         = 34;
+static HWND  g_hwndLayersPanel      = NULL;   // docked right of the canvas
+static HWND  g_hwndLayerRename      = NULL;   // in-place box for a layer's name
+static bool  g_showLayersPanel      = false;
+static const int LAYERS_PANEL_W     = 220;
+static int   g_layersPanelW         = LAYERS_PANEL_W;   // dragging its left edge changes this
+static HWND  g_hwndSideTabs         = NULL;   // rail of pane tabs, right of the canvas
+static const int SIDE_TABS_W        = 30;
 static HWND  g_hwndFolderSearchEdit = NULL;
 static int   g_folderScrollX = 0;
 static bool  g_updatingZoomEdit = false;
@@ -721,7 +748,15 @@ static bool    AnimConfirmSave(const wchar_t* filepath);
 static void    AnimOnSaved();
 static void    AnimStop();
 static bool    AnimHandleKey(const MSG& msg);
+static bool    LpHandleEscKey(const MSG& msg);
 static LRESULT CALLBACK AnimBarWndProc(HWND, UINT, WPARAM, LPARAM);
+static LRESULT CALLBACK LayersPanelWndProc(HWND, UINT, WPARAM, LPARAM);
+static LRESULT CALLBACK SideTabsWndProc(HWND, UINT, WPARAM, LPARAM);
+static void    LayersPanelSync();
+static bool    LayersConfirmFlatten(const wchar_t* filepath);
+// Goes up whenever layers other than the active one may have changed (not for
+// drawing on the active layer), so caches of the other layers know to remake themselves
+static unsigned g_layerStackGen = 0;
 static constexpr UINT WM_ANIM_FRAME = WM_APP + 0x42;   // lParam: AnimFrameMsg*
 static void    ExitFullscreen();
 static void    CloseFolderSearch();
@@ -771,7 +806,8 @@ static void CommitShape();
 static void CancelShape();
 static void CommitTextInline();
 static void CancelTextInline();
-static Bitmap* FlattenedCanvas();
+static Bitmap* FlattenedCanvas(bool exact = false);
+static bool BlockIfLayerLocked();
 static void PushUndoDocument();
 static void DropLastUndo();
 static void ClearUndoHistory();
@@ -823,11 +859,13 @@ static void ResetToOneLayer()
 {
     for (auto& l : g_layers) delete l.bmp;
     g_layers.clear();
+    g_layerStackGen++;
     Layer base;
     base.name = L"Layer 1";
     g_layers.push_back(base);
     g_activeLayer = 0;
     g_layerNameCounter = 2;
+    g_layersSaveWarned = false;
 }
 
 static void DestroyCanvas()
@@ -859,6 +897,7 @@ static void SwapActiveLayer(int i)
 {
     if (i == g_activeLayer) return;
     g_layers[g_activeLayer].bmp = g_pCanvas;
+    LayerNewUid(g_layers[g_activeLayer]);   // it may have been drawn on
     g_pCanvas = g_layers[i].bmp;
     g_layers[i].bmp = nullptr;
     g_activeLayer = i;
@@ -890,9 +929,11 @@ static bool ReplaceLayerBitmaps(int w, int h, F make)
     for (int i = 0; i < (int)g_layers.size(); i++) {
         delete g_layers[i].bmp;
         g_layers[i].bmp = i == g_activeLayer ? nullptr : fresh[i];
+        LayerNewUid(g_layers[i]);
     }
     g_pCanvas  = fresh[g_activeLayer];
     g_pPreview = preview;
+    g_layerStackGen++;
     { Graphics gp(g_pPreview); gp.Clear(Color(0, 0, 0, 0)); }
     g_previewUsed = false;
     RebindCanvasGraphics();
@@ -934,6 +975,7 @@ static UndoEntry* SnapshotLayer(int i)
 static UndoEntry* SnapshotDocument()
 {
     auto* e = new UndoEntry();
+    e->kind = UNDO_DOCUMENT;
     e->docActive = g_activeLayer;
     for (int i = 0; i < (int)g_layers.size(); i++) {
         Layer l = g_layers[i];
@@ -994,21 +1036,69 @@ static void PushUndoDocument()
     PushOntoStack(g_undoStack, SnapshotDocument());
 }
 
-// Puts the document back as e recorded it, and deletes e
-static void RestoreUndoEntry(UndoEntry* e)
+// For a change to the layer list: pushes e, which undoes it. Call before changing anything.
+static void PushUndoEntry(UndoEntry* e)
 {
+    LeaveSvgDisplay();
+    AnimLeaveForEdit();
+    ClearStack(g_redoStack);
+    PushOntoStack(g_undoStack, e);
+}
+
+// Puts the document back as e recorded it, deletes e, and returns the entry
+// that would reverse that. Bitmaps change hands rather than being copied.
+static UndoEntry* RestoreUndoEntry(UndoEntry* e)
+{
+    g_layerStackGen++;
     delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    if (e->layer >= 0) {
+    auto* inv = new UndoEntry();
+    inv->kind = e->kind;
+    if (e->kind == UNDO_PIXELS) {
         SwapActiveLayer(e->layer);   // show the layer being changed
-        delete g_pCanvas;
+        inv->layer = e->layer;
+        inv->bmp = g_pCanvas;
         g_pCanvas = e->bmp;
         e->bmp = nullptr;
-    } else {
-        delete g_pCanvas;
-        for (auto& l : g_layers) delete l.bmp;
+    } else if (e->kind == UNDO_DOCUMENT) {
+        g_layers[g_activeLayer].bmp = g_pCanvas;
+        inv->doc.swap(g_layers);
+        inv->docActive = g_activeLayer;
         g_layers.swap(e->doc);
-        e->doc.clear();
+        for (auto& l : g_layers) LayerNewUid(l);
         g_activeLayer = e->docActive;
+        g_pCanvas = g_layers[g_activeLayer].bmp;
+        g_layers[g_activeLayer].bmp = nullptr;
+    } else {
+        // Every layer holds its own bitmap while the list changes
+        g_layers[g_activeLayer].bmp = g_pCanvas;
+        LayerNewUid(g_layers[g_activeLayer]);
+        inv->active = g_activeLayer;
+        if (e->kind == UNDO_INSERT) {
+            g_layers.insert(g_layers.begin() + e->index, e->ins);
+            LayerNewUid(g_layers[e->index]);
+            e->ins.bmp = nullptr;
+            inv->kind = UNDO_REMOVE;
+            inv->index = e->index;
+        } else if (e->kind == UNDO_REMOVE) {
+            inv->kind = UNDO_INSERT;
+            inv->index = e->index;
+            inv->ins = g_layers[e->index];
+            g_layers.erase(g_layers.begin() + e->index);
+        } else {
+            Layer l = g_layers[e->index];
+            g_layers.erase(g_layers.begin() + e->index);
+            g_layers.insert(g_layers.begin() + e->to, l);
+            inv->index = e->to;
+            inv->to = e->index;
+        }
+        if (e->layer >= 0) {
+            inv->layer = e->layer;
+            inv->bmp = g_layers[e->layer].bmp;
+            g_layers[e->layer].bmp = e->bmp;
+            LayerNewUid(g_layers[e->layer]);
+            e->bmp = nullptr;
+        }
+        g_activeLayer = e->active;
         g_pCanvas = g_layers[g_activeLayer].bmp;
         g_layers[g_activeLayer].bmp = nullptr;
     }
@@ -1032,6 +1122,8 @@ static void RestoreUndoEntry(UndoEntry* e)
     UpdateTitleBar();
     UpdateStatusBar(0, 0);
     UpdateScrollBars();
+    LayersPanelSync();
+    return inv;
 }
 
 static void PopUndo()
@@ -1044,9 +1136,7 @@ static void PopUndo()
     g_selDragMode = 0;
     UndoEntry* prev = g_undoStack.back();
     g_undoStack.pop_back();
-    // Save the current state of the same thing to redo before reverting
-    PushOntoStack(g_redoStack, prev->layer >= 0 ? SnapshotLayer(prev->layer) : SnapshotDocument());
-    RestoreUndoEntry(prev);
+    PushOntoStack(g_redoStack, RestoreUndoEntry(prev));
 }
 
 static void DoRedo()
@@ -1054,9 +1144,8 @@ static void DoRedo()
     if (g_redoStack.empty()) { MessageBeep(MB_ICONEXCLAMATION); return; }
     UndoEntry* next = g_redoStack.back();
     g_redoStack.pop_back();
-    // Push the current state to undo (without touching the redo stack)
-    PushOntoStack(g_undoStack, next->layer >= 0 ? SnapshotLayer(next->layer) : SnapshotDocument());
-    RestoreUndoEntry(next);
+    // Its reverse goes to undo, without touching the redo stack
+    PushOntoStack(g_undoStack, RestoreUndoEntry(next));
 }
 
 // Every canvas change repaints through InvalidateCanvas, which bumps this so
@@ -1070,6 +1159,8 @@ static void InvalidateCanvas()
     g_canvasVersion++;
     if (g_hwndCanvas) InvalidateRect(g_hwndCanvas, NULL, FALSE);
     if (g_hwndFullscreen) InvalidateRect(g_hwndFullscreen, NULL, FALSE);
+    // Thumbnails catch up once the canvas has stopped changing for a moment
+    if (g_hwndLayersPanel && g_showLayersPanel) SetTimer(g_hwndLayersPanel, 1, 150, NULL);
 }
 
 static void InvalidateCanvasView()
@@ -1082,15 +1173,172 @@ static void InvalidateCanvasView()
 static Bitmap*  g_flatBitmap  = nullptr;
 static unsigned g_flatVersion = 0;
 
-static Bitmap* FlattenedCanvas()
+// With many layers, the visible layers below the active one and those above it
+// are kept combined, remade only when something other than the active layer's
+// pixels has changed. g_flatPartsKey records what they were made from (by uid).
+static Bitmap* g_flatBelow = nullptr;   // null when nothing visible is below
+static Bitmap* g_flatAbove = nullptr;   // or above
+static std::vector<uintptr_t> g_flatPartsKey;
+
+static void FlatFreeChunks();
+static void FlatFreeParts()
+{
+    delete g_flatBelow; g_flatBelow = nullptr;
+    delete g_flatAbove; g_flatAbove = nullptr;
+    g_flatPartsKey.clear();
+    FlatFreeChunks();
+}
+
+static void FlatPrepare(Graphics& g)
+{
+    g.SetCompositingMode(CompositingModeSourceOver);
+    g.SetInterpolationMode(InterpolationModeNearestNeighbor);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+}
+
+static void FlatDrawLayer(Graphics& g, int i, int w, int h)
+{
+    const Layer& l = g_layers[i];
+    if (!l.visible || l.opacity <= 0) return;
+    Rect dest(0, 0, w, h);
+    if (l.opacity >= 100) {
+        g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel);
+    } else {
+        ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,l.opacity / 100.0f,0, 0,0,0,0,1 };
+        ImageAttributes ia;
+        ia.SetColorMatrix(&cm);
+        g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel, &ia);
+    }
+}
+
+// Layers [from, to) combined, or null when none of them shows. ok is false when out of memory.
+static Bitmap* FlatCombine(int from, int to, int w, int h, bool& ok)
+{
+    bool any = false;
+    for (int i = from; i < to; i++) any |= g_layers[i].visible && g_layers[i].opacity > 0;
+    if (!any) return nullptr;
+    Bitmap* b = new Bitmap(w, h, PixelFormat32bppPARGB);
+    if (b->GetLastStatus() != Ok) { delete b; ok = false; return nullptr; }
+    Graphics g(b);
+    g.Clear(Color(0, 0, 0, 0));
+    FlatPrepare(g);
+    for (int i = from; i < to; i++) FlatDrawLayer(g, i, w, h);
+    return b;
+}
+
+// The below and above parts are made from chunks of about 16 layers, each kept
+// combined. A chunk ends after a layer whose uid hashes to 0 (1 in 16), so adding,
+// removing or changing a layer only changes the chunk it is in, and the others are
+// found again by what they hold. So a change to the layer list redraws a chunk
+// and the chunk images, not every layer.
+struct FlatChunk {
+    std::vector<unsigned> key;   // size, then each layer's uid and how it shows
+    Bitmap* bmp = nullptr;
+    bool    used = false;
+};
+static std::vector<FlatChunk> g_flatChunks;
+static const int FLAT_CHUNK_MAX = 32;
+
+static void FlatFreeChunks()
+{
+    for (auto& c : g_flatChunks) delete c.bmp;
+    g_flatChunks.clear();
+}
+
+static unsigned FlatLayerShow(const Layer& l) { return (unsigned)l.opacity * 2 + (l.visible ? 1 : 0); }
+
+// Draws layers [s, e), none of them active, from their cached chunk image
+static bool FlatDrawChunk(Graphics& g, int s, int e, int w, int h)
+{
+    if (e - s == 1) { FlatDrawLayer(g, s, w, h); return true; }   // nothing to save by caching
+    std::vector<unsigned> key = { (unsigned)w, (unsigned)h };
+    for (int i = s; i < e; i++) { key.push_back(g_layers[i].uid); key.push_back(FlatLayerShow(g_layers[i])); }
+    Bitmap* bmp = nullptr;
+    bool found = false;
+    for (auto& c : g_flatChunks)
+        if (c.key == key) { c.used = true; bmp = c.bmp; found = true; break; }
+    if (!found) {
+        bool ok = true;
+        bmp = FlatCombine(s, e, w, h, ok);
+        if (!ok) return false;
+        FlatChunk c;
+        c.key = std::move(key);
+        c.bmp = bmp;
+        c.used = true;
+        g_flatChunks.push_back(std::move(c));
+    }
+    if (bmp) g.DrawImage(bmp, Rect(0, 0, w, h), 0, 0, w, h, UnitPixel);
+    return true;
+}
+
+// Layers [from, to) combined through the chunks; chunks holds where each chunk starts and ends
+static Bitmap* FlatCombineChunked(int from, int to, const std::vector<std::pair<int, int>>& chunks, int w, int h, bool& ok)
+{
+    bool any = false;
+    for (int i = from; i < to; i++) any |= g_layers[i].visible && g_layers[i].opacity > 0;
+    if (!any) return nullptr;
+    Bitmap* b = new Bitmap(w, h, PixelFormat32bppPARGB);
+    if (b->GetLastStatus() != Ok) { delete b; ok = false; return nullptr; }
+    Graphics g(b);
+    g.Clear(Color(0, 0, 0, 0));
+    FlatPrepare(g);
+    for (auto [s, e] : chunks) {
+        int cs = max(s, from), ce = min(e, to);
+        if (cs >= ce) continue;
+        if (cs == s && ce == e) {
+            if (!FlatDrawChunk(g, s, e, w, h)) { delete b; ok = false; return nullptr; }
+        } else {
+            for (int i = cs; i < ce; i++) FlatDrawLayer(g, i, w, h);   // the part of the active layer's chunk
+        }
+    }
+    return b;
+}
+
+// Brings g_flatBelow and g_flatAbove up to date; false if there isn't the memory for them
+static bool FlatUpdateParts(int w, int h)
+{
+    int n = (int)g_layers.size(), a = g_activeLayer;
+    std::vector<uintptr_t> key = { (uintptr_t)a, (uintptr_t)w, (uintptr_t)h };
+    for (int i = 0; i < n; i++) { key.push_back(g_layers[i].uid); key.push_back(FlatLayerShow(g_layers[i])); }
+    if (key == g_flatPartsKey) return true;
+    delete g_flatBelow; g_flatBelow = nullptr;
+    delete g_flatAbove; g_flatAbove = nullptr;
+    g_flatPartsKey.clear();
+
+    std::vector<std::pair<int, int>> chunks;
+    for (int s = 0, i = 0; i < n; i++) {
+        bool end = ((g_layers[i].uid * 2654435761u) >> 28) == 0 || i - s + 1 >= FLAT_CHUNK_MAX || i == n - 1;
+        if (end) { chunks.push_back({ s, i + 1 }); s = i + 1; }
+    }
+    for (auto& c : g_flatChunks) c.used = false;
+    bool ok = true;
+    g_flatBelow = FlatCombineChunked(0, a, chunks, w, h, ok);
+    if (ok) g_flatAbove = FlatCombineChunked(a + 1, n, chunks, w, h, ok);
+    // Chunks no longer in the picture go
+    for (size_t i = 0; i < g_flatChunks.size();) {
+        if (g_flatChunks[i].used) { i++; continue; }
+        delete g_flatChunks[i].bmp;
+        g_flatChunks.erase(g_flatChunks.begin() + i);
+    }
+    if (!ok) { FlatFreeParts(); return false; }
+    g_flatPartsKey = key;
+    return true;
+}
+
+// exact: combined layer by layer, for saving and copying. Otherwise ready-made
+// parts may be used, which can differ by a rounding step depending on the active layer.
+static bool g_flatIsExact = false;   // whether g_flatBitmap was made layer by layer
+
+static Bitmap* FlattenedCanvas(bool exact)
 {
     if (!g_pCanvas) return nullptr;
     if (g_layers.size() <= 1 && (g_layers.empty() || (g_layers[0].visible && g_layers[0].opacity >= 100))) {
         delete g_flatBitmap; g_flatBitmap = nullptr;
+        FlatFreeParts();
         return g_pCanvas;
     }
     int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
-    if (g_flatBitmap && g_flatVersion == g_canvasVersion &&
+    if (g_flatBitmap && g_flatVersion == g_canvasVersion && (g_flatIsExact || !exact) &&
         (int)g_flatBitmap->GetWidth() == w && (int)g_flatBitmap->GetHeight() == h)
         return g_flatBitmap;
     delete g_flatBitmap;
@@ -1101,20 +1349,19 @@ static Bitmap* FlattenedCanvas()
     }
     g_flatVersion = g_canvasVersion;
     Graphics g(g_flatBitmap);
-    g.SetCompositingMode(CompositingModeSourceOver);
-    g.SetInterpolationMode(InterpolationModeNearestNeighbor);
-    g.SetPixelOffsetMode(PixelOffsetModeHalf);
-    Rect dest(0, 0, w, h);
-    for (int i = 0; i < (int)g_layers.size(); i++) {
-        if (!g_layers[i].visible || g_layers[i].opacity <= 0) continue;
-        if (g_layers[i].opacity >= 100) {
-            g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel);
-        } else {
-            ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,g_layers[i].opacity / 100.0f,0, 0,0,0,0,1 };
-            ImageAttributes ia;
-            ia.SetColorMatrix(&cm);
-            g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel, &ia);
-        }
+    FlatPrepare(g);
+    int n = (int)g_layers.size();
+    g_flatIsExact = exact || n <= 2;
+    if (!g_flatIsExact && FlatUpdateParts(w, h)) {
+        // Only the active layer changes while drawing, so the rest comes ready made
+        Rect dest(0, 0, w, h);
+        if (g_flatBelow) g.DrawImage(g_flatBelow, dest, 0, 0, w, h, UnitPixel);
+        FlatDrawLayer(g, g_activeLayer, w, h);
+        if (g_flatAbove) g.DrawImage(g_flatAbove, dest, 0, 0, w, h, UnitPixel);
+    } else {
+        if (n <= 2) FlatFreeParts();
+        for (int i = 0; i < n; i++) FlatDrawLayer(g, i, w, h);
+        g_flatIsExact = true;
     }
     return g_flatBitmap;
 }
@@ -1722,7 +1969,7 @@ static bool SavePngFile(Bitmap* bmp, const wchar_t* file)
 
 static bool SaveWebP(const wchar_t* file)
 {
-    return g_pCanvas && SaveWebPBitmap(FlattenedCanvas(), file);
+    return g_pCanvas && SaveWebPBitmap(FlattenedCanvas(true), file);
 }
 
 // Rasterise an SVG file to a pixel buffer.
@@ -2186,6 +2433,7 @@ static void SaveToFile(const wchar_t* filepath)
         return;
     }
     if (!AnimConfirmSave(filepath)) return;
+    if (!LayersConfirmFlatten(filepath)) return;
     const wchar_t* dot = wcsrchr(filepath, L'.');
     bool isWebP = dot && _wcsicmp(dot + 1, L"webp") == 0;
 
@@ -2196,13 +2444,13 @@ static void SaveToFile(const wchar_t* filepath)
     if (isWebP) {
         ok = SaveWebP(filepath);
     } else if (isJpeg) {
-        ok = SaveJpeg(FlattenedCanvas(), g_jpegQuality, filepath);
+        ok = SaveJpeg(FlattenedCanvas(true), g_jpegQuality, filepath);
     } else if (dot && _wcsicmp(dot + 1, L"png") == 0) {
-        ok = SavePngFile(FlattenedCanvas(), filepath);
+        ok = SavePngFile(FlattenedCanvas(true), filepath);
     } else {
         CLSID enc;
         if (!GetSaveEncoder(filepath, enc)) GetEncoderClsid(L"image/png", &enc);
-        ok = (FlattenedCanvas()->Save(filepath, &enc) == Ok);
+        ok = (FlattenedCanvas(true)->Save(filepath, &enc) == Ok);
     }
     SetCursor(oldCursor);
 
@@ -2565,7 +2813,7 @@ static void DoPrint()
     if (StartDocW(hPrn, &di) > 0) {
         StartPage(hPrn);
         Graphics g(hPrn);
-        g.DrawImage(FlattenedCanvas(), dx, dy, dw, dh);
+        g.DrawImage(FlattenedCanvas(true), dx, dy, dw, dh);
         EndPage(hPrn);
         EndDoc(hPrn);
     }
@@ -2641,6 +2889,8 @@ static void LoadSettings()
     if (qv(L"DarkMode", &val)) g_darkMode = (val != 0);
     if (qv(L"FolderBrowserFromFile", &val))  g_folderBrowserFromFile  = (val != 0);
     if (qv(L"FolderBrowserFromBlank", &val)) g_folderBrowserFromBlank = (val != 0);
+    if (qv(L"LayersPanel", &val)) g_showLayersPanel = (val != 0);
+    if (qv(L"LayersPanelW", &val) && val >= 170 && val <= 4000) g_layersPanelW = (int)val;
     if (qv(L"FolderSort", &val) && val <= SORT_TYPE) g_folderSort = (int)val;
     if (qv(L"FolderSortDesc", &val)) g_folderSortDesc = (val != 0);
     if (qv(L"SlideshowSeconds", &val) && (val == 3 || val == 5 || val == 10)) g_slideSeconds = (int)val;
@@ -2740,6 +2990,8 @@ static void SaveSettings()
     RegDeleteValueW(hKey, L"FolderBrowser");   // replaced by the two values above
     sv(L"FolderBrowserH", (DWORD)g_folderBrowserH);
     sv(L"SlideshowSeconds", (DWORD)g_slideSeconds);
+    sv(L"LayersPanel",      (DWORD)(g_showLayersPanel ? 1 : 0));
+    sv(L"LayersPanelW",     (DWORD)g_layersPanelW);
     sv(L"FolderSort",       (DWORD)g_folderSort);
     sv(L"FolderSortDesc",   (DWORD)(g_folderSortDesc ? 1 : 0));
     sv(L"JpegQuality",    (DWORD)g_jpegQuality);
@@ -5028,6 +5280,15 @@ static void SetImageMenuIcons()
     }
 }
 
+static const char* kLayersMenuD =   // Fluent "Layer" 24 regular (_dev/layers.svg)
+    "M20.026 12.192a2.002 2.002 0 0 1-.577.598l-6.05 4.084a2.5 2.5 0 0 1-2.798 0l-6.05-4.084a2 2 0 0 1-.779-2.29"
+    "l6.841 4.56a2.5 2.5 0 0 0 2.613.098l.16-.098 6.841-4.56a1.996 1.996 0 0 1-.201 1.692Z"
+    "m.201 1.558a1.996 1.996 0 0 1-.778 2.29l-6.05 4.084a2.5 2.5 0 0 1-2.798 0l-6.05-4.084a2 2 0 0 1-.779-2.29"
+    "l6.841 4.56a2.5 2.5 0 0 0 2.613.098l.16-.098 6.841-4.56Z"
+    "m-6.84-10.325 6.365 4.243a1 1 0 0 1 0 1.664l-6.365 4.244a2.5 2.5 0 0 1-2.774 0L4.248 9.332a1 1 0 0 1 0-1.664"
+    "l6.365-4.243a2.5 2.5 0 0 1 2.774 0ZM11.56 4.606l-.116.067L5.705 8.5l5.74 3.828a1 1 0 0 0 .994.066l.116-.066"
+    "L18.294 8.5l-5.74-3.827a1 1 0 0 0-.993-.067Z";
+
 // View menu entries. Zoom, folder browser and dark mode reuse their status bar
 // and toolbar artwork; svgD == nullptr items are drawn in SetViewMenuIcons.
 // The last item names the theme it switches to, like the toolbar's moon / sun
@@ -5039,6 +5300,7 @@ static const ImageMenuEntry kViewMenuEntries[] = {
     { ID_ZOOM_OUT,           L"Zoom &Out\tCtrl+-",        kZoomOutD,           20.0f },
     { ID_ZOOM_FIT_WINDOW,    L"Fi&t to Window\tCtrl+0",   kPageFitD,           20.0f },
     { ID_ZOOM_ACTUAL,        L"&Actual Size\tCtrl+1",     nullptr,             16.0f },
+    { ID_VIEW_LAYERS,        L"La&yers\tF7",              nullptr,             24.0f },
     { ID_FOLDER_BROWSER_BTN, L"Folder &Browser",          kFolderBrowserIconD, 20.0f },
     { 0,                     L"Folder Browser &Sort",     nullptr,             16.0f },   // the submenu
     { ID_VIEW_DARKMODE,      L"&Dark Mode\tCtrl+Shift+D", kMoonD,              24.0f },
@@ -5092,6 +5354,10 @@ static void SetViewMenuIcons()
                 g.DrawPath(&pen, &r);
                 PointF tri[3] = { {6.5f, 5.5f}, {10.5f, 8.f}, {6.5f, 10.5f} };
                 g.FillPolygon(&br, tri, 3);
+            } else if (e.cmdId == ID_VIEW_LAYERS) {
+                GraphicsPath path(FillModeWinding);
+                AddSvgPath(path, kLayersMenuD, sz / e.coordSz);
+                g.FillPath(&br, &path);
             } else if (e.cmdId == 0) {
                 // Sort: lines getting shorter, and a down arrow
                 g.DrawLine(&pen, 2.f, 4.f, 9.5f, 4.f);
@@ -5203,6 +5469,8 @@ static void ApplyDarkMode()
     if (g_hwndFolderBrowser)    InvalidateRect(g_hwndFolderBrowser,    NULL, TRUE);
     if (g_hwndFolderSearch)     InvalidateRect(g_hwndFolderSearch,     NULL, TRUE);
     if (g_hwndAnimBar)          InvalidateRect(g_hwndAnimBar,          NULL, FALSE);
+    if (g_hwndLayersPanel)      InvalidateRect(g_hwndLayersPanel,      NULL, FALSE);
+    if (g_hwndSideTabs)         InvalidateRect(g_hwndSideTabs,         NULL, FALSE);
     if (g_hwndFolderSearchEdit) InvalidateRect(g_hwndFolderSearchEdit, NULL, TRUE);
     if (g_hwndColorEdit)  InvalidateRect(g_hwndColorEdit,  NULL, TRUE);
     if (g_hwndReset)      InvalidateRect(g_hwndReset,      NULL, TRUE);
@@ -6639,7 +6907,7 @@ static void DoCopy()
         // Nothing selected: copy the whole image, as most editors do
         if (OpenClipboard(g_hwndMain)) {
             EmptyClipboard();
-            ClipboardPutBitmap(FlattenedCanvas());
+            ClipboardPutBitmap(FlattenedCanvas(true));
             CloseClipboard();
         }
         return;
@@ -6675,6 +6943,7 @@ static void DoCopy()
 
 static void DoCut()
 {
+    if (BlockIfLayerLocked()) return;
     // If a paste is active, copy it to clipboard then discard without committing
     if (g_isPasting && g_pasteBitmap) {
         DoCopy();
@@ -6844,7 +7113,7 @@ static void CancelSelectionFloat()
 
 static void DoPaste()
 {
-    if (!g_pCanvas) return;
+    if (!g_pCanvas || BlockIfLayerLocked()) return;
     bool hasARGB   = g_cfARGB && IsClipboardFormatAvailable(g_cfARGB);
     bool hasBitmap = IsClipboardFormatAvailable(CF_BITMAP) || IsClipboardFormatAvailable(CF_DIB);
     if (!hasARGB && !hasBitmap) return;
@@ -7154,6 +7423,7 @@ static void DoRotateCanvas(bool clockwise)
 
     // ── Rect / mask selection: lift into float (no canvas write until commit) ──
     if (g_hasSelection) {
+        if (BlockIfLayerLocked()) return;
         int sx = g_selRect.left,  sy = g_selRect.top;
         int sw = g_selRect.right - sx, sh = g_selRect.bottom - sy;
         if (sw > 0 && sh > 0) {
@@ -7276,6 +7546,7 @@ static void DoFlipCanvas(bool horizontal)
 
     // ── Rect / mask selection: lift into float (no canvas write until commit) ──
     if (g_hasSelection) {
+        if (BlockIfLayerLocked()) return;
         int sx = g_selRect.left,  sy = g_selRect.top;
         int sw = g_selRect.right - sx, sh = g_selRect.bottom - sy;
         if (sw > 0 && sh > 0) {
@@ -7635,6 +7906,28 @@ L"Zoom controls in the status bar (bottom-right)\r\n"
 L"Fit to window       Shrinks large images to fit; small images stay\r\n"
 L"                    at 100% (SVGs still scale up, as they stay sharp)\r\n"
 L"\r\n"
+L"LAYERS  (tab at the right of the canvas, F7, or View menu)\r\n"
+L"----------------------------------------------------------\r\n"
+L"Click the tab to open or close the panel. It lists the layers, the\r\n"
+L"top one first, and the tools draw on the highlighted layer.\r\n"
+L"Click a row         Make that layer the active one\r\n"
+L"Buttons appear at a row's top right when the mouse is over it, and each\r\n"
+L"stays while its setting isn't the default:\r\n"
+L"Eye                 Show or hide the layer\r\n"
+L"Padlock             Lock the layer: the tools and editing commands leave\r\n"
+L"                    it alone. Rotate, flip, crop and resize still change\r\n"
+L"                    every layer\r\n"
+L"Circle              Set that layer's opacity with a small slider\r\n"
+L"Drag a row          Move the layer up or down the stack\r\n"
+L"Double-click name   Rename the layer\r\n"
+L"Top buttons         New, delete, move up, move down\r\n"
+L"Right-click a row   Add, duplicate, delete, rename, raise, lower, merge\r\n"
+L"                    down; hide or show, lock or unlock other or all layers\r\n"
+L"Drag the left edge  Make the panel wider or narrower\r\n"
+L"Rotate, flip, crop and resize change every layer. The colour picker\r\n"
+L"reads the whole picture. Saving flattens for now: PNG, JPEG and the\r\n"
+L"others hold one picture, and hidden layers are left out.\r\n"
+L"\r\n"
 L"ANIMATED GIF AND WEBP\r\n"
 L"---------------------\r\n"
 L"Animated files play by themselves, with a bar above the folder browser.\r\n"
@@ -7983,6 +8276,16 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
         case WM_MOUSEMOVE:   case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
         case WM_KEYDOWN:     case WM_CHAR:
+            return 0;
+        }
+    }
+
+    // A locked layer: only looking (hand, colour picker) still works on the canvas
+    if (!g_layers.empty() && g_layers[g_activeLayer].locked) {
+        if ((msg == WM_LBUTTONDOWN && g_currentTool != TOOL_HAND && g_currentTool != TOOL_DROPPER) ||
+            (msg == WM_KEYDOWN && g_hasSelection && (wParam == VK_DELETE || wParam == VK_BACK || wParam == VK_LEFT ||
+                                                     wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN))) {
+            BlockIfLayerLocked();
             return 0;
         }
     }
@@ -12655,7 +12958,7 @@ static Bitmap* LoadBitmapForCopy(const wchar_t* path)
 static void CopyImageFileToClipboard(const std::wstring& path)
 {
     bool isCur = _wcsicmp(path.c_str(), g_currentFile) == 0;
-    Bitmap* bmp = isCur ? FlattenedCanvas() : LoadBitmapForCopy(path.c_str());
+    Bitmap* bmp = isCur ? FlattenedCanvas(true) : LoadBitmapForCopy(path.c_str());
     if (!bmp) { MessageBox(g_hwndMain, L"Could not read this image.", APP_TITLE, MB_ICONERROR); return; }
     if (OpenClipboard(g_hwndMain)) {
         EmptyClipboard();
@@ -13816,10 +14119,12 @@ static void CommitFloatingEdits()
 
 static void AfterLayerChange()
 {
+    g_layerStackGen++;
     g_modified = true;
     InvalidateCanvas();
     UpdateTitleBar();
     UpdateStatusBar(0, 0);
+    LayersPanelSync();
 }
 
 // Puts a new layer above the active one and makes it active. Takes ownership of bmp.
@@ -13829,6 +14134,7 @@ static void InsertLayerAboveActive(Bitmap* bmp, const std::wstring& name)
     l.name = name;
     g_layers.insert(g_layers.begin() + g_activeLayer + 1, l);
     g_layers[g_activeLayer].bmp = g_pCanvas;
+    LayerNewUid(g_layers[g_activeLayer]);
     g_activeLayer++;
     g_pCanvas = bmp;
     RebindCanvasGraphics();
@@ -13836,13 +14142,38 @@ static void InsertLayerAboveActive(Bitmap* bmp, const std::wstring& name)
 
 static std::wstring NextLayerName() { return L"Layer " + std::to_wstring(g_layerNameCounter++); }
 
+// An undo entry for a change to the layer list, leaving `active` active when undone
+static UndoEntry* NewLayerUndo(UndoKind kind, int index, int active)
+{
+    auto* e = new UndoEntry();
+    e->kind = kind;
+    e->index = index;
+    e->active = active;
+    return e;
+}
+
+// Undoing a layer added above the active one takes it out again
+static void PushUndoLayerAdded()
+{
+    PushUndoEntry(NewLayerUndo(UNDO_REMOVE, g_activeLayer + 1, g_activeLayer));
+}
+
+// Undoing the active layer's removal puts it back, so the entry takes its bitmap
+static void PushUndoActiveRemoved()
+{
+    auto* e = NewLayerUndo(UNDO_INSERT, g_activeLayer, g_activeLayer);
+    e->ins = g_layers[g_activeLayer];
+    e->ins.bmp = g_pCanvas;
+    PushUndoEntry(e);
+}
+
 static void LayerAdd()
 {
     if (!g_pCanvas) return;
     CommitFloatingEdits();
     Bitmap* b = new Bitmap((INT)g_pCanvas->GetWidth(), (INT)g_pCanvas->GetHeight(), PixelFormat32bppARGB);
     if (b->GetLastStatus() != Ok) { delete b; return; }
-    PushUndoDocument();
+    PushUndoLayerAdded();
     InsertLayerAboveActive(b, NextLayerName());
     AfterLayerChange();
 }
@@ -13853,7 +14184,7 @@ static void LayerDuplicate()
     CommitFloatingEdits();
     Bitmap* b = CloneWholeBitmap(g_pCanvas);
     if (!b) return;
-    PushUndoDocument();
+    PushUndoLayerAdded();
     Layer src = g_layers[g_activeLayer];
     InsertLayerAboveActive(b, src.name + L" copy");
     g_layers[g_activeLayer].visible = src.visible;
@@ -13861,13 +14192,22 @@ static void LayerDuplicate()
     AfterLayerChange();
 }
 
+// True, with a beep and a status message, when the active layer can't be edited
+static bool BlockIfLayerLocked()
+{
+    if (g_layers.empty() || !g_layers[g_activeLayer].locked) return false;
+    MessageBeep(MB_ICONEXCLAMATION);
+    std::wstring text = L" " + g_layers[g_activeLayer].name + L" is locked";
+    SetStatusText(STATUS_PANE_SEL, text.c_str());
+    return true;
+}
+
 static void LayerDelete()
 {
-    if (!g_pCanvas || g_layers.size() < 2) { MessageBeep(MB_ICONEXCLAMATION); return; }
+    if (!g_pCanvas || g_layers.size() < 2 || BlockIfLayerLocked()) { if (g_layers.size() < 2) MessageBeep(MB_ICONEXCLAMATION); return; }
     CommitFloatingEdits();
-    PushUndoDocument();
+    PushUndoActiveRemoved();   // which now owns g_pCanvas
     delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
     g_layers.erase(g_layers.begin() + g_activeLayer);
     g_activeLayer = min(g_activeLayer, (int)g_layers.size() - 1);
     g_pCanvas = g_layers[g_activeLayer].bmp;
@@ -13881,19 +14221,44 @@ static void LayerMove(int dir)
     int to = g_activeLayer + dir;
     if (!g_pCanvas || to < 0 || to >= (int)g_layers.size()) { MessageBeep(MB_ICONEXCLAMATION); return; }
     CommitFloatingEdits();
-    PushUndoDocument();
+    auto* e = NewLayerUndo(UNDO_MOVE, to, g_activeLayer);
+    e->to = g_activeLayer;
+    PushUndoEntry(e);
     std::swap(g_layers[g_activeLayer], g_layers[to]);
     g_activeLayer = to;
+    AfterLayerChange();
+}
+
+// Moves a layer to another place in the stack
+static void LayerMoveTo(int from, int to)
+{
+    int n = (int)g_layers.size();
+    if (!g_pCanvas || from == to || from < 0 || to < 0 || from >= n || to >= n) return;
+    CommitFloatingEdits();
+    auto* e = NewLayerUndo(UNDO_MOVE, to, g_activeLayer);
+    e->to = from;
+    PushUndoEntry(e);
+    Layer l = g_layers[from];
+    g_layers.erase(g_layers.begin() + from);
+    g_layers.insert(g_layers.begin() + to, l);
+    // The active layer is the one with no bitmap of its own
+    for (int i = 0; i < n; i++) if (!g_layers[i].bmp) g_activeLayer = i;
     AfterLayerChange();
 }
 
 // Draws the active layer onto the one below, at its opacity, and removes it
 static void LayerMergeDown()
 {
-    if (!g_pCanvas || g_activeLayer == 0) { MessageBeep(MB_ICONEXCLAMATION); return; }
+    if (!g_pCanvas || g_activeLayer == 0 || g_layers[g_activeLayer - 1].locked) { MessageBeep(MB_ICONEXCLAMATION); return; }
+    if (BlockIfLayerLocked()) return;
     CommitFloatingEdits();
-    PushUndoDocument();
     Layer& below = g_layers[g_activeLayer - 1];
+    // Undoing puts the active layer back and the one below as it was
+    Bitmap* belowBefore = CloneWholeBitmap(below.bmp);
+    if (!belowBefore) return;
+    PushUndoActiveRemoved();   // which now owns g_pCanvas
+    g_undoStack.back()->layer = g_activeLayer - 1;
+    g_undoStack.back()->bmp = belowBefore;
     int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
     if (g_layers[g_activeLayer].visible) {
         Graphics g(below.bmp);
@@ -13905,7 +14270,6 @@ static void LayerMergeDown()
         g.DrawImage(g_pCanvas, Rect(0, 0, w, h), 0, 0, w, h, UnitPixel, &ia);
     }
     delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
-    delete g_pCanvas;
     g_layers.erase(g_layers.begin() + g_activeLayer);
     g_activeLayer--;
     g_pCanvas = g_layers[g_activeLayer].bmp;
@@ -13923,6 +14287,22 @@ static void LayerSetActive(int i)
     SwapActiveLayer(i);
     RebindCanvasGraphics();
     InvalidateCanvas();
+    LayersPanelSync();
+}
+
+// Saving to a flat format loses the layers. Asked once per document.
+static bool LayersConfirmFlatten(const wchar_t* filepath)
+{
+    if (g_layers.size() < 2 || g_layersSaveWarned) return true;
+    const wchar_t* dot = wcsrchr(filepath, L'.');
+    wchar_t msg[300];
+    StringCchPrintf(msg, ARRAYSIZE(msg),
+        L"This image has %d layers, and %s files can't keep layers, so this saves the flattened "
+        L"picture (hidden layers are left out).\n\nYour layers stay open here until you close "
+        L"the image.", (int)g_layers.size(), dot ? dot + 1 : L"image");
+    if (MessageBox(g_hwndMain, msg, APP_TITLE, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return false;
+    g_layersSaveWarned = true;
+    return true;
 }
 
 static void LayerSetVisible(int i, bool visible)
@@ -13932,11 +14312,966 @@ static void LayerSetVisible(int i, bool visible)
     AfterLayerChange();
 }
 
+static void LayerSetLocked(int i, bool locked)
+{
+    if (i < 0 || i >= (int)g_layers.size()) return;
+    if (locked && i == g_activeLayer) CommitFloatingEdits();   // whatever is under way lands first
+    g_layers[i].locked = locked;
+}
+
 static void LayerSetOpacity(int i, int percent)
 {
     if (i < 0 || i >= (int)g_layers.size()) return;
     g_layers[i].opacity = max(0, min(100, percent));
     AfterLayerChange();
+}
+
+// ─── Layers panel (View menu, F7) ────────────────────────────
+// Docked to the right of the canvas. Rows run top layer first, as they stack:
+// a thumbnail and the name, with opacity, lock and show/hide buttons at the row's
+// top right. They appear when the mouse is over the row, and each stays while its
+// setting isn't the default (below 100%, locked, hidden). Above the rows, buttons
+// for new, delete and move; the rest is on the right-click menu. A row can be
+// dragged to a new place, double-clicking its name renames it, and dragging the
+// panel's left edge resizes it.
+static const int LP_HEAD_H = 36, LP_ROW_H = 46;
+static const int LP_MIN_W = 170, LP_EDGE_W = 5;   // narrowest, and the band of the left edge that resizes
+static const int LP_THUMB_W = 46, LP_THUMB_H = 36;
+enum { LPB_ADD, LPB_DELETE, LPB_UP, LPB_DOWN, LPB_COUNT, LPB_DUP, LPB_MERGE };   // after COUNT: menu icons only
+static const UINT_PTR LP_THUMB_TIMER = 1;
+static std::vector<Bitmap*> g_layerThumbs;
+static int  g_lpScroll = 0;
+static bool g_lpResizing = false;     // dragging the panel's left edge
+static int  g_lpResizeX0 = 0, g_lpResizeW0 = 0;
+static int  g_lpHotRow = -1;          // layer of the row under the mouse
+static HWND g_hwndLpOpacityPop = NULL;   // the slider opened by a row's opacity button
+static int  g_lpOpacityPopLayer = -1;
+static bool g_lpOpacityPopDrag = false;
+static int  g_lpPressLayer = -1;      // row pressed: a drag starts once the mouse moves
+static POINT g_lpPressPt = {};
+static bool g_lpDragging = false;
+static int  g_lpDropGap = -1;         // display gap the drag would drop into (0 = above the top row)
+static int  g_layerRenameIdx = -1;
+static HWND g_hwndLpTip = NULL;
+
+static int LpListH(int h) { return max(0, h - LP_HEAD_H); }
+static int LpMaxScroll(int h) { return max(0, (int)g_layers.size() * LP_ROW_H - LpListH(h)); }
+static int LpRowTop(int layer) { return LP_HEAD_H + ((int)g_layers.size() - 1 - layer) * LP_ROW_H - g_lpScroll; }
+static RECT LpButtonRect(int b) { return { LP_EDGE_W + b * 32, 4, LP_EDGE_W + (b + 1) * 32, LP_HEAD_H - 4 }; }
+static const int LP_THUMB_X = 6, LP_TEXT_X = LP_THUMB_X + LP_THUMB_W + 8, LP_ROWBTN = 20;
+enum { LRB_EYE, LRB_LOCK, LRB_OPACITY, LRB_COUNT };   // right to left
+static RECT LpRowBtnRect(int top, int w, int b)
+{
+    int r = w - 6 - b * LP_ROWBTN;
+    return { r - LP_ROWBTN, top + 2, r, top + 2 + LP_ROWBTN };
+}
+static RECT LpNameRect(int top, int w) { return { LP_TEXT_X, top + 22, w - 6, top + LP_ROW_H - 2 }; }
+
+// The row button at pt, or -1
+static int LpRowBtnAt(int layer, int w, POINT pt)
+{
+    for (int b = 0; b < LRB_COUNT; b++) {
+        RECT r = LpRowBtnRect(LpRowTop(layer), w, b);
+        if (PtInRect(&r, pt)) return b;
+    }
+    return -1;
+}
+
+// The layer on the row at client y, or -1
+static int LpLayerAtY(int y, int h)
+{
+    if (y < LP_HEAD_H || y >= h) return -1;
+    int r = (y - LP_HEAD_H + g_lpScroll) / LP_ROW_H;
+    int n = (int)g_layers.size();
+    return r < n ? n - 1 - r : -1;
+}
+
+static bool LpButtonEnabled(int b)
+{
+    int n = (int)g_layers.size();
+    switch (b) {
+    case LPB_DELETE: return n > 1 && !g_layers[g_activeLayer].locked;
+    case LPB_UP:     return g_activeLayer < n - 1;
+    case LPB_DOWN:   return g_activeLayer > 0;
+    }
+    return true;
+}
+
+static void LpFreeThumbs()
+{
+    for (auto* t : g_layerThumbs) delete t;
+    g_layerThumbs.clear();
+}
+
+// Thumbnails are made only for rows in view, as they are painted. A null entry
+// is one still to make. g_lpThumbsGen is the g_layerStackGen they belong to.
+static unsigned g_lpThumbsGen = 0;
+
+// Forgets every thumbnail, to be remade as rows are painted
+static void LpRebuildThumbs()
+{
+    LpFreeThumbs();
+    g_layerThumbs.resize(g_layers.size(), nullptr);
+    g_lpThumbsGen = g_layerStackGen;
+}
+
+// The canvas changed: drawing only changes the active layer, anything else changes them all
+static void LpCanvasChangedThumbs()
+{
+    if (g_layerThumbs.size() != g_layers.size() || g_lpThumbsGen != g_layerStackGen) { LpRebuildThumbs(); return; }
+    if (g_activeLayer >= 0 && g_activeLayer < (int)g_layerThumbs.size()) {
+        delete g_layerThumbs[g_activeLayer];
+        g_layerThumbs[g_activeLayer] = nullptr;
+    }
+}
+
+static Bitmap* LpThumb(int i)
+{
+    if (!g_pCanvas || i < 0 || i >= (int)g_layers.size()) return nullptr;
+    if (g_layerThumbs.size() != g_layers.size() || g_lpThumbsGen != g_layerStackGen) LpRebuildThumbs();
+    if (g_layerThumbs[i]) return g_layerThumbs[i];
+    int cw = (int)g_pCanvas->GetWidth(), ch = (int)g_pCanvas->GetHeight();
+    double s = min((double)LP_THUMB_W / cw, (double)LP_THUMB_H / ch);
+    int dw = max(1, (int)(cw * s)), dh = max(1, (int)(ch * s));
+    int dx = (LP_THUMB_W - dw) / 2, dy = (LP_THUMB_H - dh) / 2;
+    SolidBrush light(Color(255, 255, 255, 255)), dark(Color(255, 205, 205, 205));
+    Bitmap* t = new Bitmap(LP_THUMB_W, LP_THUMB_H, PixelFormat32bppPARGB);
+    {
+        Graphics g(t);
+        g.Clear(Color(0, 0, 0, 0));
+        // A checkerboard behind the picture shows what is transparent
+        g.SetClip(Rect(dx, dy, dw, dh));
+        for (int y = 0; y < LP_THUMB_H; y += 5)
+            for (int x = 0; x < LP_THUMB_W; x += 5)
+                g.FillRectangle(((x + y) / 5) % 2 ? &dark : &light, x, y, 5, 5);
+        g.ResetClip();
+        g.SetInterpolationMode(InterpolationModeLowQuality);   // redone as the image changes
+        g.DrawImage(LayerBitmap(i), dx, dy, dw, dh);
+    }
+    g_layerThumbs[i] = t;
+    return t;
+}
+
+// The layer list changed: thumbnails and rows at once. Also keeps the active row in view.
+static void LayersPanelSync()
+{
+    if (!g_hwndLayersPanel || !g_showLayersPanel) return;
+    KillTimer(g_hwndLayersPanel, LP_THUMB_TIMER);
+    LpRebuildThumbs();
+    RECT rc; GetClientRect(g_hwndLayersPanel, &rc);
+    int top = LpRowTop(g_activeLayer);
+    if (top < LP_HEAD_H) g_lpScroll -= LP_HEAD_H - top;
+    else if (top + LP_ROW_H > rc.bottom) g_lpScroll += top + LP_ROW_H - rc.bottom;
+    g_lpScroll = max(0, min(g_lpScroll, LpMaxScroll(rc.bottom)));
+    InvalidateRect(g_hwndLayersPanel, NULL, FALSE);
+}
+
+static void EndLayerRename(bool apply)
+{
+    HWND edit = g_hwndLayerRename;
+    if (!edit) return;
+    g_hwndLayerRename = NULL;   // first: destroying the edit sends WM_KILLFOCUS
+    wchar_t name[128] = {};
+    GetWindowTextW(edit, name, ARRAYSIZE(name));
+    DestroyWindow(edit);
+    StrTrimW(name, L" ");
+    if (apply && name[0] && g_layerRenameIdx >= 0 && g_layerRenameIdx < (int)g_layers.size() &&
+        g_layers[g_layerRenameIdx].name != name) {
+        g_layers[g_layerRenameIdx].name = name;
+        g_modified = true;
+        UpdateTitleBar();
+    }
+    g_layerRenameIdx = -1;
+    if (g_hwndCanvas) SetFocus(g_hwndCanvas);
+    if (g_hwndLayersPanel) InvalidateRect(g_hwndLayersPanel, NULL, FALSE);
+}
+
+static LRESULT CALLBACK LayerRenameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                                UINT_PTR, DWORD_PTR)
+{
+    switch (msg) {
+    case WM_GETDLGCODE: return DLGC_WANTALLKEYS;
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN) { EndLayerRename(true);  return 0; }
+        if (wParam == VK_ESCAPE) { EndLayerRename(false); return 0; }
+        break;
+    case WM_CHAR:
+        if (wParam == VK_RETURN || wParam == VK_ESCAPE) return 0;   // no beep
+        break;
+    case WM_KILLFOCUS:
+        // Clicking elsewhere keeps the new name
+        if (hwnd == g_hwndLayerRename) PostMessage(GetParent(hwnd), WM_APP, 0, 0);
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, LayerRenameSubclassProc, 0);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static void BeginLayerRename(HWND panel, int layer)
+{
+    EndLayerRename(true);
+    RECT rc; GetClientRect(panel, &rc);
+    RECT r = LpNameRect(LpRowTop(layer), rc.right);
+    g_layerRenameIdx = layer;
+    g_hwndLayerRename = CreateWindowExW(0, L"EDIT", g_layers[layer].name.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        r.left, r.top, r.right - r.left, 22, panel, NULL, GetModuleHandle(NULL), NULL);
+    if (!g_hwndLayerRename) return;
+    SendMessage(g_hwndLayerRename, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
+    SendMessage(g_hwndLayerRename, EM_LIMITTEXT, 120, 0);
+    SetWindowSubclass(g_hwndLayerRename, LayerRenameSubclassProc, 0, 0);
+    SendMessage(g_hwndLayerRename, EM_SETSEL, 0, -1);
+    SetFocus(g_hwndLayerRename);
+}
+
+// _dev/hidden_showing_icons.svg: stroked, in its own coordinates
+static const char* const kEyeShowingD[] = {
+    "M 163.50977,143.94452 165.18309,141.949",
+    "M 157.02193,143.87405 155.359,141.87853",
+    "M 155.4,146.225 C 156.40032,148.12833 158.13461,149.39577 160.3,149.39462 162.54969,149.39343 164.25085,148.09711 165.2,146.225",
+    "M 155.4,146.04129 C 156.40032,144.13796 158.13461,142.87052 160.3,142.87167 162.54969,142.87286 164.25085,144.16918 165.2,146.04129",
+    "M 160.3,142.83471 V 140.17402",
+    "M 161.1,145.91101 A 0.80000001,0.80000001 0 0 1 160.30022,146.71101 0.80000001,0.80000001 0 0 1 159.5,145.91145 0.80000001,0.80000001 0 0 1 160.29934,145.11101 0.80000001,0.80000001 0 0 1 161.1,145.91013",
+};
+static const char* const kEyeHiddenD[] = {
+    "M 155.4,123.8 C 156.40032,125.70333 158.13461,126.97077 160.3,126.96962 162.54969,126.96843 164.25085,125.67211 165.2,123.8",
+    "M 157.02253,125.96724 155.3596,127.96276",
+    "M 160.3,127.00658 V 129.66727",
+    "M 163.53916,125.92567 165.21248,127.92119",
+};
+// _dev/icon_lock_on.svg and icon_lock_off.svg, viewBox 21 20 86 86
+static const char* kLockOnD =
+    "M 64,25 C 54.04,24.97 44,31.77 44,39.5 V 57 H 38 V 98 H 90 V 57 H 84 V 39.5 C 84,32.93 75.24,25.03 64,25 Z "
+    "M 64,35 C 68.6,34.92 74,37.56 74,41.5 V 57 H 54 V 41.5 C 54,37.91 58.63,35.1 64,35 Z";
+static const char* kLockOffD =
+    "M 79,57 H 90 V 98 H 38 V 57 H 69 V 39.5 C 69,32.34 76.28,24.93 87.5,25 C 97.69,25.06 106,32.17 106,39.5 V 56 H 96 V 41.5 "
+    "C 96,37.44 92.06,34.97 87.5,35 C 82.69,35.03 79,37.15 79,41.5 Z";
+
+static void LpDrawRowButton(Graphics& g, int b, const RECT& r, const Layer& l, Color ink)
+{
+    float cx = (r.left + r.right) / 2.f, cy = (r.top + r.bottom) / 2.f;
+    if (b == LRB_EYE) {
+        const float s = 1.25f;  // the artwork is about 10 units wide
+        Pen pen(ink, 2.0f);     // a little under its 2-unit strokes, to stay open at this size
+        pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound); pen.SetLineJoin(LineJoinRound);
+        float ox = 160.3f, oy = l.visible ? 144.78f : 126.73f;
+        auto stroke = [&](const char* d) {
+            GraphicsPath path;
+            AddSvgPath(path, d, s);
+            Matrix m; m.Translate(cx - ox * s, cy - oy * s);
+            path.Transform(&m);
+            g.DrawPath(&pen, &path);
+        };
+        if (l.visible) for (auto d : kEyeShowingD) stroke(d);
+        else           for (auto d : kEyeHiddenD)  stroke(d);
+    } else if (b == LRB_LOCK) {
+        const float size = 15.f, s = size / 86.f;
+        GraphicsPath path(FillModeWinding);
+        AddSvgPath(path, l.locked ? kLockOnD : kLockOffD, s);
+        Matrix m; m.Translate(cx - size / 2 - 21.f * s, cy - size / 2 - 20.f * s);
+        path.Transform(&m);
+        SolidBrush br(ink);
+        g.FillPath(&br, &path);
+    } else {
+        // Opacity: a circle filled from the bottom up to the layer's opacity
+        Pen pen(ink, 1.3f);
+        SolidBrush br(ink);
+        g.DrawEllipse(&pen, cx - 5.5f, cy - 5.5f, 11.f, 11.f);
+        float level = 11.f * l.opacity / 100.f;
+        GraphicsState saved = g.Save();
+        g.IntersectClip(RectF(cx - 7.f, cy + 5.5f - level, 14.f, level));
+        g.FillEllipse(&br, cx - 5.5f, cy - 5.5f, 11.f, 11.f);
+        g.Restore(saved);
+    }
+}
+
+static void LpDrawButton(Graphics& g, int b, const RECT& r, Color ink)
+{
+    float cx = (r.left + r.right) / 2.f, cy = (r.top + r.bottom) / 2.f;
+    Pen pen(ink, 1.4f);
+    pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound); pen.SetLineJoin(LineJoinRound);
+    switch (b) {
+    case LPB_ADD:
+        g.DrawLine(&pen, cx - 7.f, cy, cx + 7.f, cy);
+        g.DrawLine(&pen, cx, cy - 7.f, cx, cy + 7.f);
+        break;
+    case LPB_DUP:   // two overlapping sheets
+        g.DrawRectangle(&pen, cx - 7.f, cy - 7.f, 10.f, 10.f);
+        g.DrawRectangle(&pen, cx - 3.f, cy - 3.f, 10.f, 10.f);
+        break;
+    case LPB_DELETE: {
+        GraphicsPath path(FillModeWinding);
+        AddSvgPath(path, kFileDeleteD, 18.f / 24.f);
+        Matrix m; m.Translate(cx - 9.f, cy - 9.f); path.Transform(&m);
+        SolidBrush br(ink);
+        g.FillPath(&br, &path);
+        break;
+    }
+    case LPB_UP: case LPB_DOWN: {
+        float s = b == LPB_UP ? -1.f : 1.f;
+        g.DrawLine(&pen, cx - 6.f, cy - 3.f * s, cx, cy + 3.f * s);
+        g.DrawLine(&pen, cx + 6.f, cy - 3.f * s, cx, cy + 3.f * s);
+        break;
+    }
+    case LPB_MERGE:   // an arrow down onto a line
+        g.DrawLine(&pen, cx, cy - 7.f, cx, cy + 2.f);
+        g.DrawLine(&pen, cx - 4.f, cy - 2.f, cx, cy + 2.f);
+        g.DrawLine(&pen, cx + 4.f, cy - 2.f, cx, cy + 2.f);
+        g.DrawLine(&pen, cx - 7.f, cy + 6.f, cx + 7.f, cy + 6.f);
+        break;
+    }
+}
+
+static void LpPaint(HWND hwnd, HDC hdc)
+{
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    Bitmap back(max(1, w), max(1, h), PixelFormat32bppPARGB);
+    {
+        Graphics g(&back);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        g.Clear(g_darkMode ? Color(255, 28, 28, 28) : Color(255, 235, 235, 235));
+        Color ink   = g_darkMode ? Color(255, 220, 220, 220) : Color(255, 45, 45, 45);
+        Color faint = g_darkMode ? Color(255, 120, 120, 120) : Color(255, 150, 150, 150);
+        Color sep   = g_darkMode ? Color(255, 60, 60, 60) : Color(255, 180, 180, 180);
+        Color accent(255, 0, 120, 215);
+        SolidBrush fg(ink), fgFaint(faint), acc(accent);
+        Pen sepPen(sep, 1.f);
+        FontFamily ff(L"Segoe UI");
+        Font font(&ff, 9.f, FontStyleRegular, UnitPoint), fontSmall(&ff, 8.f, FontStyleRegular, UnitPoint);
+        StringFormat sf;
+        sf.SetLineAlignment(StringAlignmentCenter);
+        sf.SetTrimming(StringTrimmingEllipsisCharacter);
+        sf.SetFormatFlags(StringFormatFlagsNoWrap);
+        int n = (int)g_layers.size();
+
+        // Rows, clipped below the buttons
+        g.SetClip(Rect(0, LP_HEAD_H, w, LpListH(h)));
+        for (int i = 0; i < n; i++) {
+            int top = LpRowTop(i);
+            if (top + LP_ROW_H <= LP_HEAD_H || top >= h) continue;
+            bool active = i == g_activeLayer;
+            if (active) {
+                SolidBrush rowBg(g_darkMode ? Color(255, 0, 72, 130) : Color(255, 200, 225, 247));
+                g.FillRectangle(&rowBg, 0, top, w, LP_ROW_H);
+            }
+            // Thumbnail
+            int tx = LP_THUMB_X, ty = top + (LP_ROW_H - LP_THUMB_H) / 2;
+            if (Bitmap* thumb = LpThumb(i))
+                g.DrawImage(thumb, tx, ty, LP_THUMB_W, LP_THUMB_H);
+            g.DrawRectangle(&sepPen, tx, ty, LP_THUMB_W - 1, LP_THUMB_H - 1);
+            // Name below the buttons, and the opacity beside them when it isn't 100%
+            RECT nr = LpNameRect(top, w);
+            SolidBrush& nameBr = g_layers[i].visible ? fg : fgFaint;
+            g.DrawString(g_layers[i].name.c_str(), -1, &font, RectF((REAL)nr.left, (REAL)nr.top, (REAL)(nr.right - nr.left), (REAL)(nr.bottom - nr.top)), &sf, &nameBr);
+            if (g_layers[i].opacity < 100) {
+                std::wstring pct = std::to_wstring(g_layers[i].opacity) + L"%";
+                g.DrawString(pct.c_str(), -1, &fontSmall, RectF((REAL)LP_TEXT_X, (REAL)top + 2, 50.f, (REAL)LP_ROWBTN), &sf, &fgFaint);
+            }
+            // Buttons at the row's top right
+            for (int b = 0; b < LRB_COUNT; b++) {
+                // Only on hover, but a button stays while its setting isn't the default
+                bool keep = (b == LRB_EYE && !g_layers[i].visible) || (b == LRB_LOCK && g_layers[i].locked) ||
+                            (b == LRB_OPACITY && (g_layers[i].opacity < 100 || (g_hwndLpOpacityPop && g_lpOpacityPopLayer == i)));
+                if (g_lpHotRow != i && !keep) continue;
+                LpDrawRowButton(g, b, LpRowBtnRect(top, w, b), g_layers[i], ink);
+            }
+            g.DrawLine(&sepPen, 0, top + LP_ROW_H - 1, w, top + LP_ROW_H - 1);
+        }
+        if (g_lpDragging && g_lpDropGap >= 0) {
+            float y = (float)(LP_HEAD_H + g_lpDropGap * LP_ROW_H - g_lpScroll);
+            g.FillRectangle(&acc, 0.f, y - 1.f, (float)w, 3.f);
+        }
+        g.ResetClip();
+
+        // Buttons
+        g.DrawLine(&sepPen, 0, LP_HEAD_H - 1, w, LP_HEAD_H - 1);
+        for (int b = 0; b < LPB_COUNT; b++)
+            LpDrawButton(g, b, LpButtonRect(b), LpButtonEnabled(b) ? ink : faint);
+        g.SetSmoothingMode(SmoothingModeNone);
+        g.DrawLine(&sepPen, 0, 0, 0, h);   // the edge against the canvas
+    }
+    Graphics screen(hdc);
+    screen.DrawImage(&back, 0, 0, w, h);
+}
+
+// Keeps the panel between LP_MIN_W and half the window
+static int LpClampWidth(int w)
+{
+    RECT rc; GetClientRect(g_hwndMain, &rc);
+    return max(LP_MIN_W, min(w, max((int)LP_MIN_W, (int)rc.right / 2)));
+}
+
+// Every other layer, or all of them, shown or hidden / locked or unlocked
+static void LayersSetVisibleAll(bool visible, int except)
+{
+    for (int i = 0; i < (int)g_layers.size(); i++) if (i != except) g_layers[i].visible = visible;
+    AfterLayerChange();
+}
+
+static void LayersSetLockedAll(bool locked, int except)
+{
+    if (locked && except != g_activeLayer) CommitFloatingEdits();
+    for (int i = 0; i < (int)g_layers.size(); i++) if (i != except) g_layers[i].locked = locked;
+    if (g_hwndLayersPanel) InvalidateRect(g_hwndLayersPanel, NULL, FALSE);
+}
+
+enum { LRM_ADD = 1, LRM_DUPLICATE, LRM_DELETE, LRM_RENAME, LRM_RAISE, LRM_LOWER, LRM_MERGE,
+       LRM_OTHERS_VISIBLE, LRM_HIDE_ALL, LRM_SHOW_ALL, LRM_OTHERS_LOCKED, LRM_LOCK_ALL, LRM_UNLOCK_ALL };
+
+// The right-click menu of a row. It acts on that layer, which becomes the active
+// one; clicking below the rows (layer -1) offers only what needs no layer.
+static void LpShowRowMenu(HWND hwnd, int layer, POINT pt)
+{
+    if (layer >= 0) { LayerSetActive(layer); LayersPanelSync(); }
+    int n = (int)g_layers.size();
+    bool has = layer >= 0;
+    bool otherVisible = false, otherUnlocked = false, anyVisible = false, anyHidden = false, anyLocked = false, anyUnlocked = false;
+    for (int i = 0; i < n; i++) {
+        (g_layers[i].visible ? anyVisible : anyHidden) = true;
+        (g_layers[i].locked ? anyLocked : anyUnlocked) = true;
+        if (i != layer && g_layers[i].visible) otherVisible = true;
+        if (i != layer && !g_layers[i].locked) otherUnlocked = true;
+    }
+    auto flag = [](bool on) { return (UINT)(MF_STRING | (on ? MF_ENABLED : MF_GRAYED)); };
+    bool locked = has && g_layers[layer].locked;
+    bool canMerge = has && layer > 0 && !locked && !g_layers[layer - 1].locked;
+
+    COLORREF crBg = g_darkMode ? RGB(43, 43, 43) : GetSysColor(COLOR_MENU);
+    COLORREF crText = g_darkMode ? RGB(220, 220, 220) : GetSysColor(COLOR_MENUTEXT);
+    Color menuBg(255, GetRValue(crBg), GetGValue(crBg), GetBValue(crBg));
+    Color iconClr(255, GetRValue(crText), GetGValue(crText), GetBValue(crText));
+    std::vector<HBITMAP> icons;
+    HMENU hm = CreatePopupMenu();
+    // Icons are the panel's own, drawn on the menu's background
+    auto item = [&](UINT id, const wchar_t* text, bool on, int barGlyph, int rowGlyph, bool hidden, bool lockedIcon) {
+        AppendMenuW(hm, flag(on), id, text);
+        Bitmap bmp(20, 20, PixelFormat32bppARGB);
+        {
+            Graphics g(&bmp);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.Clear(menuBg);
+            RECT r = { 0, 0, 20, 20 };
+            if (barGlyph >= 0) LpDrawButton(g, barGlyph, r, iconClr);
+            else if (rowGlyph >= 0) {
+                Layer l;
+                l.visible = !hidden;
+                l.locked = lockedIcon;
+                LpDrawRowButton(g, rowGlyph, r, l, iconClr);
+            }
+        }
+        HBITMAP hb = NULL;
+        if (bmp.GetHBITMAP(menuBg, &hb) == Ok && hb) {
+            icons.push_back(hb);
+            MENUITEMINFOW mii = { sizeof(mii) };
+            mii.fMask = MIIM_BITMAP;
+            mii.hbmpItem = hb;
+            SetMenuItemInfoW(hm, id, FALSE, &mii);
+        }
+    };
+    item(LRM_ADD,       L"&Add Layer",       true,                 LPB_ADD,    -1, false, false);
+    item(LRM_DUPLICATE, L"&Duplicate Layer", has,                  LPB_DUP,    -1, false, false);
+    item(LRM_DELETE,    L"De&lete Layer",    has && n > 1 && !locked, LPB_DELETE, -1, false, false);
+    item(LRM_RENAME,    L"Re&name Layer",    has,                  -1,         -1, false, false);
+    AppendMenuW(hm, MF_SEPARATOR, 0, NULL);
+    item(LRM_RAISE,     L"&Raise Layer",     has && layer < n - 1, LPB_UP,     -1, false, false);
+    item(LRM_LOWER,     L"Lo&wer Layer",     has && layer > 0,     LPB_DOWN,   -1, false, false);
+    item(LRM_MERGE,     L"&Merge Down",      canMerge,             LPB_MERGE,  -1, false, false);
+    AppendMenuW(hm, MF_SEPARATOR, 0, NULL);
+    item(LRM_OTHERS_VISIBLE, otherVisible ? L"&Hide Other Layers" : L"Show O&ther Layers", has && n > 1, -1, LRB_EYE, otherVisible, false);
+    item(LRM_HIDE_ALL,  L"H&ide All Layers", anyVisible,           -1, LRB_EYE, true, false);
+    item(LRM_SHOW_ALL,  L"&Show All Layers", anyHidden,            -1, LRB_EYE, false, false);
+    AppendMenuW(hm, MF_SEPARATOR, 0, NULL);
+    item(LRM_OTHERS_LOCKED, otherUnlocked ? L"Loc&k Other Layers" : L"Unloc&k Other Layers", has && n > 1, -1, LRB_LOCK, false, otherUnlocked);
+    item(LRM_LOCK_ALL,  L"L&ock All Layers", anyUnlocked,          -1, LRB_LOCK, false, true);
+    item(LRM_UNLOCK_ALL, L"&Unlock All Layers", anyLocked,         -1, LRB_LOCK, false, false);
+
+    POINT sp = pt; ClientToScreen(hwnd, &sp);
+    int cmd = (int)TrackPopupMenu(hm, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, g_hwndMain, NULL);
+    DestroyMenu(hm);
+    for (HBITMAP hb : icons) DeleteObject(hb);
+
+    switch (cmd) {
+    case LRM_ADD:       LayerAdd();       break;
+    case LRM_DUPLICATE: LayerDuplicate(); break;
+    case LRM_DELETE:    LayerDelete();    break;
+    case LRM_RENAME:    BeginLayerRename(hwnd, g_activeLayer); break;
+    case LRM_RAISE:     LayerMove(+1);    break;
+    case LRM_LOWER:     LayerMove(-1);    break;
+    case LRM_MERGE:     LayerMergeDown(); break;
+    case LRM_OTHERS_VISIBLE: LayersSetVisibleAll(!otherVisible, layer); break;
+    case LRM_HIDE_ALL:  LayersSetVisibleAll(false, -1); break;
+    case LRM_SHOW_ALL:  LayersSetVisibleAll(true, -1);  break;
+    case LRM_OTHERS_LOCKED: LayersSetLockedAll(otherUnlocked, layer); break;
+    case LRM_LOCK_ALL:  LayersSetLockedAll(true, -1);   break;
+    case LRM_UNLOCK_ALL: LayersSetLockedAll(false, -1); break;
+    }
+}
+
+static void LpCloseOpacityPop()
+{
+    HWND pop = g_hwndLpOpacityPop;
+    if (!pop) return;
+    g_hwndLpOpacityPop = NULL;   // first: destroying it releases the capture
+    g_lpOpacityPopDrag = false;
+    DestroyWindow(pop);
+    if (g_hwndLayersPanel) InvalidateRect(g_hwndLayersPanel, NULL, FALSE);
+}
+
+static RECT LpPopSliderRect(int w) { return { 12, 8, w - 50, 26 }; }
+
+static void LpPopSetFromX(HWND hwnd, int x)
+{
+    RECT rc; GetClientRect(hwnd, &rc);
+    RECT sr = LpPopSliderRect(rc.right);
+    LayerSetOpacity(g_lpOpacityPopLayer, (int)((double)(x - sr.left) / (sr.right - sr.left) * 100.0 + 0.5));
+    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_hwndLayersPanel) InvalidateRect(g_hwndLayersPanel, NULL, FALSE);
+}
+
+// A small slider beside a row. It holds the mouse until a click lands outside it.
+static LRESULT CALLBACK LpOpacityPopWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        Bitmap back(max(1, (int)rc.right), max(1, (int)rc.bottom), PixelFormat32bppPARGB);
+        {
+            Graphics g(&back);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+            g.Clear(g_darkMode ? Color(255, 45, 45, 45) : Color(255, 250, 250, 250));
+            int op = g_lpOpacityPopLayer >= 0 && g_lpOpacityPopLayer < (int)g_layers.size() ? g_layers[g_lpOpacityPopLayer].opacity : 100;
+            RECT sr = LpPopSliderRect(rc.right);
+            float tw = (float)(sr.right - sr.left), my = (sr.top + sr.bottom) / 2.f;
+            SolidBrush rail(g_darkMode ? Color(255, 80, 80, 80) : Color(255, 190, 190, 190)), acc(Color(255, 0, 120, 215));
+            g.FillRectangle(&rail, (float)sr.left, my - 2.f, tw, 4.f);
+            g.FillRectangle(&acc, (float)sr.left, my - 2.f, tw * op / 100.f, 4.f);
+            g.FillEllipse(&acc, sr.left + tw * op / 100.f - 6.f, my - 6.f, 12.f, 12.f);
+            FontFamily ff(L"Segoe UI");
+            Font font(&ff, 9.f, FontStyleRegular, UnitPoint);
+            StringFormat sf;
+            sf.SetLineAlignment(StringAlignmentCenter);
+            SolidBrush fg(g_darkMode ? Color(255, 220, 220, 220) : Color(255, 45, 45, 45));
+            std::wstring pct = std::to_wstring(op) + L"%";
+            g.DrawString(pct.c_str(), -1, &font, RectF((REAL)sr.right + 8.f, 0.f, 42.f, (REAL)rc.bottom), &sf, &fg);
+        }
+        Graphics screen(hdc);
+        screen.DrawImage(&back, 0, 0, rc.right, rc.bottom);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        if (!PtInRect(&rc, pt)) { LpCloseOpacityPop(); return 0; }
+        g_lpOpacityPopDrag = true;
+        LpPopSetFromX(hwnd, pt.x);
+        return 0;
+    }
+    case WM_RBUTTONDOWN:
+        LpCloseOpacityPop();
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_lpOpacityPopDrag) LpPopSetFromX(hwnd, GET_X_LPARAM(lParam));
+        return 0;
+    case WM_LBUTTONUP:
+        g_lpOpacityPopDrag = false;
+        return 0;
+    case WM_CAPTURECHANGED:   // another app took over
+        if (hwnd == g_hwndLpOpacityPop) LpCloseOpacityPop();
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void LpOpenOpacityPop(HWND panel, int layer, const RECT& button)
+{
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEX wc = {};
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = LpOpacityPopWndProc;
+        wc.hInstance     = GetModuleHandle(NULL);
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"MyPaintLayerOpacityPop";
+        registered = RegisterClassEx(&wc) != 0;
+    }
+    LpCloseOpacityPop();
+    const int popW = 170, popH = 34;
+    POINT pt = { button.right - popW, button.bottom + 2 };
+    ClientToScreen(panel, &pt);
+    g_lpOpacityPopLayer = layer;
+    g_hwndLpOpacityPop = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"MyPaintLayerOpacityPop", NULL, WS_POPUP | WS_BORDER,
+        pt.x, pt.y, popW, popH, g_hwndMain, NULL, GetModuleHandle(NULL), NULL);
+    if (!g_hwndLpOpacityPop) return;
+    ShowWindow(g_hwndLpOpacityPop, SW_SHOWNOACTIVATE);
+    SetCapture(g_hwndLpOpacityPop);
+}
+
+static void LpPressRowButton(HWND hwnd, int layer, int b, const RECT& r)
+{
+    switch (b) {
+    case LRB_EYE:     LayerSetVisible(layer, !g_layers[layer].visible); break;
+    case LRB_LOCK:    LayerSetLocked(layer, !g_layers[layer].locked);   break;
+    case LRB_OPACITY: LpOpenOpacityPop(hwnd, layer, r);                 break;
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static LRESULT CALLBACK LayersPanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (ForwardWheelToHovered(hwnd, msg, wParam, lParam)) return 0;
+    switch (msg) {
+    case WM_CREATE: {
+        g_hwndLpTip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL, WS_POPUP | TTS_ALWAYSTIP,
+            0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
+        static const wchar_t* kTips[LPB_COUNT] = { L"New layer", L"Delete layer", L"Move layer up", L"Move layer down" };
+        for (int b = 0; b < LPB_COUNT; b++) {
+            TOOLINFOW ti = { sizeof(ti) };
+            ti.uFlags = TTF_SUBCLASS;
+            ti.hwnd = hwnd;
+            ti.uId = b;
+            ti.rect = LpButtonRect(b);
+            ti.lpszText = const_cast<LPWSTR>(kTips[b]);
+            SendMessage(g_hwndLpTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        LpPaint(hwnd, hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wParam == LP_THUMB_TIMER) {
+            KillTimer(hwnd, LP_THUMB_TIMER);
+            LpCanvasChangedThumbs();
+            {
+                RECT rc; GetClientRect(hwnd, &rc);
+                g_lpScroll = max(0, min(g_lpScroll, LpMaxScroll(rc.bottom)));
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_SIZE: {
+        EndLayerRename(true);
+        g_lpScroll = max(0, min(g_lpScroll, LpMaxScroll(HIWORD(lParam))));
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+        EndLayerRename(true);
+        RECT rc; GetClientRect(hwnd, &rc);
+        g_lpScroll -= GET_WHEEL_DELTA_WPARAM(wParam) * LP_ROW_H / WHEEL_DELTA;
+        g_lpScroll = max(0, min(g_lpScroll, LpMaxScroll(rc.bottom)));
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        EndLayerRename(true);
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        if (pt.x < LP_EDGE_W) {
+            POINT sp = pt; ClientToScreen(hwnd, &sp);
+            g_lpResizing = true;
+            g_lpResizeX0 = sp.x;
+            g_lpResizeW0 = rc.right;
+            SetCapture(hwnd);
+            return 0;
+        }
+        for (int b = 0; b < LPB_COUNT; b++) {
+            RECT r = LpButtonRect(b);
+            if (!PtInRect(&r, pt) || !LpButtonEnabled(b)) continue;
+            switch (b) {
+            case LPB_ADD:    LayerAdd();    break;
+            case LPB_DELETE: LayerDelete(); break;
+            case LPB_UP:     LayerMove(+1); break;
+            case LPB_DOWN:   LayerMove(-1); break;
+            }
+            return 0;
+        }
+        int layer = LpLayerAtY(pt.y, rc.bottom);
+        if (layer < 0) return 0;
+        int rowBtn = LpRowBtnAt(layer, rc.right, pt);
+        if (rowBtn >= 0) {
+            LpPressRowButton(hwnd, layer, rowBtn, LpRowBtnRect(LpRowTop(layer), rc.right, rowBtn));
+            return 0;
+        }
+        LayerSetActive(layer);
+        LayersPanelSync();
+        g_lpPressLayer = g_activeLayer;
+        g_lpPressPt = pt;
+        SetCapture(hwnd);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        if (g_lpResizing) {
+            // The panel moves as it resizes, so work in screen coordinates
+            POINT sp = pt; ClientToScreen(hwnd, &sp);
+            int w = LpClampWidth(g_lpResizeW0 + (g_lpResizeX0 - sp.x));
+            if (w != g_layersPanelW) {
+                g_layersPanelW = w;
+                LayoutCanvasAndFolderBrowser(g_hwndMain);
+                UpdateWindow(g_hwndMain);
+            }
+            return 0;
+        }
+        if (g_lpPressLayer >= 0) {
+            if (!g_lpDragging && abs(pt.y - g_lpPressPt.y) > 4) g_lpDragging = true;
+            if (g_lpDragging) {
+                int n = (int)g_layers.size();
+                int gap = (pt.y + g_lpScroll + LP_ROW_H / 2) / LP_ROW_H;
+                gap = max(0, min(gap, n));
+                if (gap != g_lpDropGap) { g_lpDropGap = gap; InvalidateRect(hwnd, NULL, FALSE); }
+            }
+            return 0;
+        }
+        int hotRow = LpLayerAtY(pt.y, rc.bottom);
+        if (hotRow != g_lpHotRow) {
+            g_lpHotRow = hotRow;
+            InvalidateRect(hwnd, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_lpHotRow = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_SETCURSOR: {
+        POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+        if (LOWORD(lParam) == HTCLIENT && (g_lpResizing || pt.x < LP_EDGE_W)) {
+            SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_RBUTTONUP: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        EndLayerRename(true);
+        LpShowRowMenu(hwnd, LpLayerAtY(pt.y, rc.bottom), pt);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (g_lpResizing) {
+            g_lpResizing = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            if (g_zoomFitMode) ZoomToFit(); else CenterScrollOnCanvas();
+            InvalidateCanvas();
+            return 0;
+        }
+        bool dropped = g_lpDragging && g_lpDropGap >= 0;
+        int from = g_lpPressLayer, gap = g_lpDropGap;
+        g_lpPressLayer = -1;
+        g_lpDragging = false;
+        g_lpDropGap = -1;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (dropped) {
+            // A gap counts rows from the top; the row itself leaves a space when lifted
+            int n = (int)g_layers.size();
+            int fromRow = n - 1 - from;
+            int toRow = gap > fromRow ? gap - 1 : gap;
+            if (toRow != fromRow) LayerMoveTo(from, n - 1 - toRow);
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED:
+        g_lpResizing = false;
+        g_lpPressLayer = -1;
+        g_lpDragging = false;
+        g_lpDropGap = -1;
+        return 0;
+
+    case WM_LBUTTONDBLCLK: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        int layer = LpLayerAtY(pt.y, rc.bottom);
+        if (layer < 0) return 0;
+        int rowBtn = LpRowBtnAt(layer, rc.right, pt);
+        if (rowBtn >= 0) {   // quick clicks on a button are two presses
+            LpPressRowButton(hwnd, layer, rowBtn, LpRowBtnRect(LpRowTop(layer), rc.right, rowBtn));
+            return 0;
+        }
+        RECT nr = LpNameRect(LpRowTop(layer), rc.right);
+        nr.top = LpRowTop(layer);   // anywhere beside the thumbnail
+        if (PtInRect(&nr, pt)) BeginLayerRename(hwnd, layer);
+        return 0;
+    }
+
+    case WM_APP:   // the rename box lost focus
+        EndLayerRename(true);
+        return 0;
+
+    case WM_CTLCOLOREDIT:
+        if (g_darkMode && (HWND)lParam == g_hwndLayerRename) {
+            static HBRUSH hbr = CreateSolidBrush(RGB(45, 45, 45));
+            SetTextColor((HDC)wParam, RGB(230, 230, 230));
+            SetBkColor((HDC)wParam, RGB(45, 45, 45));
+            return (LRESULT)hbr;
+        }
+        break;
+
+    case WM_DESTROY:
+        LpFreeThumbs();
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// Esc closes the opacity slider, wherever the keyboard focus is
+static bool LpHandleEscKey(const MSG& msg)
+{
+    if (!g_hwndLpOpacityPop || msg.message != WM_KEYDOWN || msg.wParam != VK_ESCAPE) return false;
+    LpCloseOpacityPop();
+    return true;
+}
+
+static void ToggleLayersPanel()
+{
+    g_showLayersPanel = !g_showLayersPanel;
+    if (g_hwndSideTabs) InvalidateRect(g_hwndSideTabs, NULL, FALSE);
+    if (!g_hwndLayersPanel) return;
+    // The panel is placed before it is shown, and hidden before the canvas grows over it
+    if (!g_showLayersPanel) { EndLayerRename(true); ShowWindow(g_hwndLayersPanel, SW_HIDE); }
+    LayoutCanvasAndFolderBrowser(g_hwndMain);
+    if (g_showLayersPanel) { LayersPanelSync(); ShowWindow(g_hwndLayersPanel, SW_SHOW); }
+    else LpFreeThumbs();
+    if (g_zoomFitMode) ZoomToFit(); else CenterScrollOnCanvas();
+    InvalidateCanvas();
+}
+
+// ─── Side tabs ───────────────────────────────────────────────
+// A narrow rail at the right of the canvas with one vertical tab per side pane.
+// The open pane sits against the rail, and its tab joins onto it. Layers is the
+// only pane so far; a colour mixer or others would add a tab to the list here.
+static const int ST_TAB_TOP = 6, ST_TAB_H = 38;
+enum { STAB_LAYERS, STAB_COUNT };
+static int g_stHot = -1;
+
+static RECT StTabRect(int t) { return { 0, ST_TAB_TOP + t * (ST_TAB_H + 2), SIDE_TABS_W, ST_TAB_TOP + t * (ST_TAB_H + 2) + ST_TAB_H }; }
+static bool StTabOpen(int t) { return t == STAB_LAYERS && g_showLayersPanel; }
+
+static LRESULT CALLBACK SideTabsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        HWND tip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL, WS_POPUP | TTS_ALWAYSTIP,
+            0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
+        static const wchar_t* kTips[STAB_COUNT] = { L"Layers (F7)" };
+        for (int t = 0; t < STAB_COUNT; t++) {
+            TOOLINFOW ti = { sizeof(ti) };
+            ti.uFlags = TTF_SUBCLASS;
+            ti.hwnd = hwnd;
+            ti.uId = t;
+            ti.rect = StTabRect(t);
+            ti.lpszText = const_cast<LPWSTR>(kTips[t]);
+            SendMessage(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        Bitmap back(max(1, (int)rc.right), max(1, (int)rc.bottom), PixelFormat32bppPARGB);
+        {
+            Graphics g(&back);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.Clear(g_darkMode ? Color(255, 40, 40, 42) : Color(255, 222, 222, 222));
+            Pen edge(g_darkMode ? Color(255, 60, 60, 60) : Color(255, 180, 180, 180), 1.f);
+            g.SetSmoothingMode(SmoothingModeNone);
+            g.DrawLine(&edge, 0, 0, 0, (int)rc.bottom);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            for (int t = 0; t < STAB_COUNT; t++) {
+                RECT r = StTabRect(t);
+                bool open = StTabOpen(t);
+                if (open || t == g_stHot) {
+                    // The open tab takes the pane's colour and covers the edge, joining onto it
+                    SolidBrush bg(open ? (g_darkMode ? Color(255, 28, 28, 28) : Color(255, 235, 235, 235))
+                                       : (g_darkMode ? Color(255, 60, 60, 62) : Color(255, 205, 205, 205)));
+                    g.SetSmoothingMode(SmoothingModeNone);
+                    g.FillRectangle(&bg, open ? 0 : 1, (INT)r.top, (INT)(r.right - (open ? 0 : 1)), ST_TAB_H);
+                    g.SetSmoothingMode(SmoothingModeAntiAlias);
+                }
+                if (open) {
+                    SolidBrush acc(Color(255, 0, 120, 215));
+                    g.FillRectangle(&acc, (INT)r.right - 3, (INT)r.top, 3, ST_TAB_H);
+                }
+                GraphicsPath path(FillModeWinding);
+                AddSvgPath(path, kLayersMenuD, 20.f / 24.f);
+                Matrix m; m.Translate((SIDE_TABS_W - 20) / 2.f - (open ? 1.f : 0.f), r.top + (ST_TAB_H - 20) / 2.f);
+                path.Transform(&m);
+                SolidBrush ink(g_darkMode ? Color(255, 220, 220, 220) : Color(255, 45, 45, 45));
+                g.FillPath(&ink, &path);
+            }
+        }
+        Graphics screen(hdc);
+        screen.DrawImage(&back, 0, 0, rc.right, rc.bottom);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        for (int t = 0; t < STAB_COUNT; t++) {
+            RECT r = StTabRect(t);
+            if (PtInRect(&r, pt) && t == STAB_LAYERS) ToggleLayersPanel();
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hot = -1;
+        for (int t = 0; t < STAB_COUNT; t++) { RECT r = StTabRect(t); if (PtInRect(&r, pt)) hot = t; }
+        if (hot != g_stHot) {
+            g_stHot = hot;
+            InvalidateRect(hwnd, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_stHot = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 // ─── Animated GIF / WebP playback ────────────────────────────
@@ -14519,12 +15854,20 @@ static void LayoutCanvasAndFolderBrowser(HWND hwndMain)
     int canvasY = TOOLBAR_HEIGHT + COLORSTRIP_H;
     int barH    = (g_animActive && g_hwndAnimBar) ? ANIM_BAR_H : 0;
     int canvasH = max(0, H - canvasY - statusH - stripH - barH);
+    int tabsW   = g_hwndSideTabs ? SIDE_TABS_W : 0;
+    int panelW  = (g_showLayersPanel && g_hwndLayersPanel) ? min(g_layersPanelW, max(170, W / 2)) : 0;
 
     // The search panel, when open, takes the left end of the strip's row
     int searchW = (showStrip && g_folderSearchOpen && g_hwndFolderSearch) ? min(FOLDER_SEARCH_W, W / 2) : 0;
 
     // Move them in one step so the gaps between them never show
-    HDWP dwp = BeginDeferWindowPos(4);
+    HDWP dwp = BeginDeferWindowPos(6);
+    if (dwp && tabsW)
+        dwp = DeferWindowPos(dwp, g_hwndSideTabs, NULL, W - tabsW, canvasY, tabsW, canvasH,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+    if (dwp && panelW)
+        dwp = DeferWindowPos(dwp, g_hwndLayersPanel, NULL, W - tabsW - panelW, canvasY, panelW, canvasH,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && barH)
         dwp = DeferWindowPos(dwp, g_hwndAnimBar, NULL, 0, H - statusH - stripH - barH, W, barH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
@@ -14535,7 +15878,7 @@ static void LayoutCanvasAndFolderBrowser(HWND hwndMain)
         dwp = DeferWindowPos(dwp, g_hwndFolderBrowser, NULL, searchW, H - statusH - stripH, W - searchW, stripH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && g_hwndCanvas)
-        dwp = DeferWindowPos(dwp, g_hwndCanvas, NULL, 0, canvasY, W, canvasH,
+        dwp = DeferWindowPos(dwp, g_hwndCanvas, NULL, 0, canvasY, max(0, W - tabsW - panelW), canvasH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp) EndDeferWindowPos(dwp);
 }
@@ -16060,6 +17403,22 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_hwndAnimBar = CreateWindowEx(0, L"MyPaintAnimBar", NULL, WS_CHILD | WS_CLIPSIBLINGS,
                 0, 0, 0, ANIM_BAR_H, hwnd, nullptr, GetModuleHandle(NULL), NULL);
             // shown for animated files
+
+            wcs.style         = CS_DBLCLKS;
+            wcs.lpfnWndProc   = LayersPanelWndProc;
+            wcs.lpszClassName = L"MyPaintLayersPanel";
+            RegisterClassEx(&wcs);
+            g_hwndLayersPanel = CreateWindowEx(0, L"MyPaintLayersPanel", NULL,
+                WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,   // rename box
+                0, 0, LAYERS_PANEL_W, 100, hwnd, nullptr, GetModuleHandle(NULL), NULL);
+            // shown from its side tab or the View menu (WM_APP restores it at startup)
+
+            wcs.style         = 0;
+            wcs.lpfnWndProc   = SideTabsWndProc;
+            wcs.lpszClassName = L"MyPaintSideTabs";
+            RegisterClassEx(&wcs);
+            g_hwndSideTabs = CreateWindowEx(0, L"MyPaintSideTabs", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                0, 0, SIDE_TABS_W, 100, hwnd, nullptr, GetModuleHandle(NULL), NULL);
         }
 
         // Register canvas class
@@ -16503,6 +17862,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_APP:
         // Deferred from WM_CREATE — runs after ShowWindow/SetWindowPos settle the final layout
         CenterScrollOnCanvas();
+        if (g_showLayersPanel && g_hwndLayersPanel) { LayersPanelSync(); ShowWindow(g_hwndLayersPanel, SW_SHOW); }
         // Open the folder browser if it was open the last time MyPaint was started
         // the same way (with or without an image; it takes focus). This runs after
         // the command-line image is loaded, so it lists that folder
@@ -16646,6 +18006,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_FOLDER_SEARCH:
             OpenFolderSearch();
             break;
+        case ID_VIEW_LAYERS:          ToggleLayersPanel();         break;
         case ID_LAYER_ADD:            LayerAdd();                  break;
         case ID_LAYER_DELETE:         LayerDelete();               break;
         case ID_LAYER_DUPLICATE:      LayerDuplicate();            break;
@@ -17012,6 +18373,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 }
                 if (subIdx == 3) {
                     HMENU hView = GetSubMenu(g_hMenuMain, 3);
+                    CheckMenuItem(hView, ID_VIEW_LAYERS,        MF_BYCOMMAND | (g_showLayersPanel ? MF_CHECKED : MF_UNCHECKED));
                     CheckMenuItem(hView, ID_FOLDER_BROWSER_BTN, MF_BYCOMMAND | (g_showFolderBrowser ? MF_CHECKED : MF_UNCHECKED));
                     for (int i = 0, n = GetMenuItemCount(hView); i < n; i++)
                         if (HMENU sub = GetSubMenu(hView, i)) FillFolderSortMenu(sub);
@@ -17161,6 +18523,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         CancelPaste();
         delete g_selFloatBitmap; g_selFloatBitmap = nullptr;
         DestroyCanvas();
+        // Child windows are destroyed after this, so GDI+ objects they own go now
+        LpFreeThumbs();
         GdiplusShutdown(g_gdiplusToken);
         PostQuitMessage(0);
         return 0;
@@ -17291,10 +18655,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
         }
         if (g_hwndHelp && IsDialogMessage(g_hwndHelp, &msg))
             continue;
+        if (LpHandleEscKey(msg)) continue;
         if (AnimHandleKey(msg)) continue;
         // Ctrl+C, Ctrl+V, Ctrl+A etc. in the strip's text boxes edit the text,
         // not the image; Ctrl+F still reaches the search
-        bool inStripEdit = msg.hwnd && (msg.hwnd == g_hwndFolderSearchEdit || msg.hwnd == g_hwndFolderRename) &&
+        bool inStripEdit = msg.hwnd && (msg.hwnd == g_hwndFolderSearchEdit || msg.hwnd == g_hwndFolderRename ||
+                                        msg.hwnd == g_hwndLayerRename) &&
                            !(msg.message == WM_KEYDOWN && msg.wParam == 'F');
         // Full screen is for looking: its keys move through the folder, and
         // editing shortcuts must not change the hidden image

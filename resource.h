@@ -46,6 +46,7 @@
 #define ID_VIEW_DARKMODE        40601
 #define ID_VIEW_FULLSCREEN      40602   // F11
 #define ID_VIEW_SLIDESHOW       40603   // F5
+#define ID_VIEW_LAYERS          40604   // F7
 // Folder browser sort order (View > Folder Browser Sort, strip menu > Sort by)
 #define ID_SORT_NAME            40610
 #define ID_SORT_TAKEN           40611

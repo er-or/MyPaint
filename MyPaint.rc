@@ -52,6 +52,7 @@ BEGIN
         MENUITEM "Fi&t to Window\tCtrl+0",  ID_ZOOM_FIT_WINDOW
         MENUITEM "&Actual Size\tCtrl+1",    ID_ZOOM_ACTUAL
         MENUITEM SEPARATOR
+        MENUITEM "La&yers\tF7",             ID_VIEW_LAYERS
         MENUITEM "Folder &Browser",         ID_FOLDER_BROWSER_BTN
         POPUP "Folder Browser &Sort"
         BEGIN
@@ -78,6 +79,7 @@ BEGIN
     "D",    ID_VIEW_DARKMODE,   VIRTKEY, CONTROL, SHIFT
     VK_F11, ID_VIEW_FULLSCREEN, VIRTKEY
     VK_F5,  ID_VIEW_SLIDESHOW,  VIRTKEY
+    VK_F7,  ID_VIEW_LAYERS,     VIRTKEY
     "F",    ID_FOLDER_SEARCH,   VIRTKEY, CONTROL
     // Zoom: Ctrl+= / Ctrl+- (main keys 0xBB / 0xBD, also the numpad), Ctrl+0 fit, Ctrl+1 100%
     0xBB,   ID_ZOOM_IN,         VIRTKEY, CONTROL

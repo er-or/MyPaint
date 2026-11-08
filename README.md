@@ -19,6 +19,15 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Zoom:** fit to window (shrinks large images, never enlarges small ones),
   fill window, Ctrl + scroll; keyboard Ctrl+= / Ctrl+− to zoom, Ctrl+0 to fit,
   Ctrl+1 for 100%
+- **Layers (tab at the right of the canvas, F7, or View menu):** a panel with
+  a thumbnail and name for each layer, with show/hide, lock and opacity buttons
+  at the row's top right. They appear on hover, and each stays while its setting
+  isn't the default (hidden, locked, below 100%). Buttons at the top add, delete
+  and move layers, and right-clicking a row adds duplicate, rename, merge down,
+  and hiding or locking other layers or all of them. Drag the panel's left edge
+  to resize it. Drag a row to reorder it; double-click its name
+  to rename it. Saving flattens for now, since PNG, JPEG and the others hold one
+  picture, and MyPaint says so the first time.
 - **Animated GIF and WebP:** play by themselves, with a bar above the folder
   browser: play/pause (Space), step a frame (`,` and `.`), and a track to drag.
   MyPaint can't save animations yet: editing or saving works on the frame
