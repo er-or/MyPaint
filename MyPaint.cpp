@@ -70,6 +70,7 @@ using std::min;
 
 #include "resource.h"
 #include "Img.h"
+#include "Zip.h"
 
 // ============================================================
 //  Constants
@@ -2227,8 +2228,12 @@ static Bitmap* LoadSvgToBitmap(const wchar_t* path, float scale, float* pScaleUs
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+static void LoadOraNow(const wchar_t* path);
+static bool IsOraPath(const wchar_t* p);
+
 static void LoadImageFromPath(const wchar_t* file)
 {
+    if (IsOraPath(file)) { LoadOraNow(file); return; }
     const wchar_t* dot = wcsrchr(file, L'.');
     bool isWebP = dot && _wcsicmp(dot + 1, L"webp") == 0;
     bool isSVG  = dot && _wcsicmp(dot + 1, L"svg")  == 0;
@@ -2342,6 +2347,413 @@ static void InstallCanvasImage(Bitmap* bmp, const wchar_t* file, bool isSVG, boo
     }
 }
 
+// ─── OpenRaster (.ora) ───────────────────────────────────────────────────────
+// The open layered format GIMP, Krita, Inkscape's cousins and others share
+// (https://www.openraster.org/). It is a zip (Zip.h) holding:
+//   mimetype                   "image/openraster", first and stored, so the file can be recognised
+//   stack.xml                  the layers, top first: name, PNG, position, opacity, visibility, blend
+//   data/layerN.png            each layer's pixels
+//   mergedimage.png            the whole picture, for programs that only show it
+//   Thumbnails/thumbnail.png   the picture at up to 256 x 256
+// Groups (a <stack> inside the stack) are opened as their layers, with the
+// group's opacity and visibility passed down to them.
+
+static bool IsOraPath(const wchar_t* p)
+{
+    const wchar_t* dot = wcsrchr(p, L'.');
+    return dot && _wcsicmp(dot + 1, L"ora") == 0;
+}
+
+static std::string ToUtf8(const std::wstring& s)
+{
+    if (s.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n, nullptr, nullptr);
+    return out;
+}
+
+static std::wstring FromUtf8(const std::string& s)
+{
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring out(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+    return out;
+}
+
+static std::string XmlEscape(const std::string& s)
+{
+    std::string out;
+    for (char c : s) {
+        switch (c) {
+        case '&':  out += "&amp;";  break;
+        case '<':  out += "&lt;";   break;
+        case '>':  out += "&gt;";   break;
+        case '"':  out += "&quot;"; break;
+        case '\'': out += "&apos;"; break;
+        default:   out += c;
+        }
+    }
+    return out;
+}
+
+static std::string XmlUnescape(const std::string& s)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '&') { out += s[i]; continue; }
+        size_t semi = s.find(';', i);
+        if (semi == std::string::npos) { out += s[i]; continue; }
+        std::string ent = s.substr(i + 1, semi - i - 1);
+        if      (ent == "amp")  out += '&';
+        else if (ent == "lt")   out += '<';
+        else if (ent == "gt")   out += '>';
+        else if (ent == "quot") out += '"';
+        else if (ent == "apos") out += '\'';
+        else if (!ent.empty() && ent[0] == '#') {
+            unsigned long cp = ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')
+                ? strtoul(ent.c_str() + 2, nullptr, 16) : strtoul(ent.c_str() + 1, nullptr, 10);
+            out += ToUtf8(std::wstring(1, (wchar_t)cp));   // characters past U+FFFF are rare in layer names
+        } else {
+            out += s.substr(i, semi - i + 1);   // not one we know: leave it
+        }
+        i = semi;
+    }
+    return out;
+}
+
+// The attributes of one XML tag, such as <layer name="Sky" src="data/a.png"/>
+static std::vector<std::pair<std::string, std::string>> XmlAttributes(const std::string& tag)
+{
+    std::vector<std::pair<std::string, std::string>> attrs;
+    size_t i = tag.find_first_of(" \t\r\n");
+    while (i != std::string::npos && i < tag.size()) {
+        size_t eq = tag.find('=', i);
+        if (eq == std::string::npos) break;
+        size_t q = tag.find_first_of("\"'", eq);
+        if (q == std::string::npos) break;
+        size_t qe = tag.find(tag[q], q + 1);
+        if (qe == std::string::npos) break;
+        std::string name = tag.substr(i, eq - i);
+        name.erase(0, name.find_first_not_of(" \t\r\n"));
+        name.erase(name.find_last_not_of(" \t\r\n") + 1);
+        attrs.push_back({ name, XmlUnescape(tag.substr(q + 1, qe - q - 1)) });
+        i = qe + 1;
+    }
+    return attrs;
+}
+
+static std::string XmlAttr(const std::vector<std::pair<std::string, std::string>>& attrs, const char* name, const char* fallback = "")
+{
+    for (auto& a : attrs) if (a.first == name) return a.second;
+    return fallback;
+}
+
+// OpenRaster names blend modes as SVG does, with "svg:" in front
+static std::string OraCompositeOp(BlendMode m)
+{
+    if (m == BlendMode::Normal) return "svg:src-over";
+    return std::string("svg:") + Img::blendKey(m);
+}
+
+static BlendMode OraBlendFromOp(const std::string& op)
+{
+    std::string key = op.compare(0, 4, "svg:") == 0 ? op.substr(4) : op;
+    for (int m = 0; m < (int)BlendMode::Count; m++)
+        if (key == Img::blendKey((BlendMode)m)) return (BlendMode)m;
+    return BlendMode::Normal;   // src-over, and ones MyPaint doesn't have (plus, dst-in, ...)
+}
+
+// A layer's pixels as PNG bytes, keeping transparency
+static bool EncodePngBytes(Bitmap* bmp, std::vector<uint8_t>& out)
+{
+    IStream* st = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(NULL, TRUE, &st)) || !st) return false;
+    bool ok = EncodePng(bmp, false, true, st);
+    HGLOBAL hg = NULL;
+    STATSTG ss = {};
+    if (ok) ok = SUCCEEDED(GetHGlobalFromStream(st, &hg)) && SUCCEEDED(st->Stat(&ss, STATFLAG_NONAME));
+    if (ok) {
+        const uint8_t* p = (const uint8_t*)GlobalLock(hg);
+        ok = p != nullptr;
+        if (ok) { out.assign(p, p + (size_t)ss.cbSize.QuadPart); GlobalUnlock(hg); }
+    }
+    st->Release();
+    return ok;
+}
+
+// PNG (or any format WIC reads) bytes to straight-alpha BGRA. COM must be
+// initialised on the calling thread.
+static bool DecodeImageBytes(const std::vector<uint8_t>& bytes, DecodedImage& out)
+{
+    IWICImagingFactory*    fac   = nullptr;
+    IWICStream*            st    = nullptr;
+    IWICBitmapDecoder*     dec   = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter*   conv  = nullptr;
+    UINT w = 0, h = 0;
+    HRESULT hr = bytes.empty() ? E_FAIL : CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac));
+    if (SUCCEEDED(hr)) hr = fac->CreateStream(&st);
+    if (SUCCEEDED(hr)) hr = st->InitializeFromMemory((BYTE*)bytes.data(), (DWORD)bytes.size());
+    if (SUCCEEDED(hr)) hr = fac->CreateDecoderFromStream(st, nullptr, WICDecodeMetadataCacheOnDemand, &dec);
+    if (SUCCEEDED(hr)) hr = dec->GetFrame(0, &frame);
+    if (SUCCEEDED(hr)) hr = fac->CreateFormatConverter(&conv);
+    if (SUCCEEDED(hr)) hr = conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+                                             nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (SUCCEEDED(hr)) hr = conv->GetSize(&w, &h);
+    if (SUCCEEDED(hr) && (w == 0 || h == 0 || w > 32767 || h > 32767)) hr = E_FAIL;
+    if (SUCCEEDED(hr)) {
+        out.w = (int)w; out.h = (int)h; out.premultiplied = false;
+        out.px.resize((size_t)w * h * 4);
+        hr = conv->CopyPixels(nullptr, w * 4, (UINT)out.px.size(), out.px.data());
+    }
+    if (conv)  conv->Release();
+    if (frame) frame->Release();
+    if (dec)   dec->Release();
+    if (st)    st->Release();
+    if (fac)   fac->Release();
+    return SUCCEEDED(hr);
+}
+
+static bool ReadWholeFile(const wchar_t* path, std::vector<uint8_t>& out)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return false;
+    _fseeki64(f, 0, SEEK_END);
+    long long n = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    bool ok = n >= 0 && n < 0x7FFFFFFF;
+    if (ok) {
+        out.resize((size_t)n);
+        ok = fread(out.data(), 1, (size_t)n, f) == (size_t)n;
+    }
+    fclose(f);
+    return ok;
+}
+
+static bool SaveOra(const wchar_t* file)
+{
+    if (!g_pCanvas) return false;
+    int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
+    Zip::Writer zip;
+    zip.add("mimetype", std::string("image/openraster"));   // must come first
+
+    // stack.xml lists the layers top first
+    std::string xml = "<?xml version='1.0' encoding='UTF-8'?>\n";
+    xml += "<image version=\"0.0.5\" w=\"" + std::to_string(w) + "\" h=\"" + std::to_string(h) + "\">\n <stack>\n";
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> pngs;
+    for (int i = (int)g_layers.size() - 1; i >= 0; i--) {
+        const Layer& l = g_layers[i];
+        std::string src = "data/layer" + std::to_string(i) + ".png";
+        std::vector<uint8_t> png;
+        if (!EncodePngBytes(LayerBitmap(i), png)) return false;
+        pngs.push_back({ src, std::move(png) });
+        char opacity[16];
+        StringCchPrintfA(opacity, ARRAYSIZE(opacity), "%.3f", l.opacity / 100.0);
+        xml += "  <layer name=\"" + XmlEscape(ToUtf8(l.name)) + "\" src=\"" + src + "\" x=\"0\" y=\"0\""
+               " opacity=\"" + opacity + "\""
+               " visibility=\"" + (l.visible ? "visible" : "hidden") + "\""
+               " composite-op=\"" + OraCompositeOp(l.blend) + "\""
+               " edit-locked=\"" + (l.locked ? "true" : "false") + "\""
+               + (i == g_activeLayer ? " selected=\"true\"" : "") + "/>\n";
+    }
+    xml += " </stack>\n</image>\n";
+    zip.add("stack.xml", xml);
+    for (auto& p : pngs) zip.add(p.first, p.second);
+
+    // The whole picture, and a thumbnail of it
+    Bitmap* flat = FlattenedCanvas(true);
+    std::vector<uint8_t> png;
+    if (!flat || !EncodePngBytes(flat, png)) return false;
+    zip.add("mergedimage.png", png);
+    double s = min(1.0, min(256.0 / w, 256.0 / h));
+    int tw = max(1, (int)(w * s + 0.5)), th = max(1, (int)(h * s + 0.5));
+    Bitmap thumb(tw, th, PixelFormat32bppARGB);
+    {
+        Graphics g(&thumb);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(PixelOffsetModeHalf);
+        g.DrawImage(flat, 0, 0, tw, th);
+    }
+    if (!EncodePngBytes(&thumb, png)) return false;
+    zip.add("Thumbnails/thumbnail.png", png);
+
+    std::vector<uint8_t> bytes = zip.finish();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, file, L"wb") != 0 || !f) return false;
+    bool ok = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    ok = fclose(f) == 0 && ok;
+    return ok;
+}
+
+// One layer read from an .ora, at the image's full size
+struct OraLayer {
+    std::wstring name;
+    bool visible = true;
+    int opacity = 100;
+    BlendMode blend = BlendMode::Normal;
+    bool locked = false;
+    bool selected = false;
+    DecodedImage img;   // BGRA, the whole image's size
+};
+
+// Reads an .ora into its layers, bottom first. Runs on the loading thread.
+static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<OraLayer>& layers)
+{
+    std::vector<uint8_t> bytes;
+    Zip::Reader zip;
+    std::vector<uint8_t> xmlBytes;
+    if (!ReadWholeFile(path, bytes) || !zip.open(std::move(bytes)) || !zip.extract("stack.xml", xmlBytes)) return false;
+    std::string xml(xmlBytes.begin(), xmlBytes.end());
+
+    // Walk the tags. Groups pass their opacity and visibility down.
+    struct Group { double opacity; bool visible; };
+    struct Placed { int x = 0, y = 0; DecodedImage part; };
+    std::vector<Group> groups;
+    std::vector<OraLayer> topFirst;
+    std::vector<Placed> parts;   // beside topFirst
+    w = h = 0;
+    for (size_t i = xml.find('<'); i != std::string::npos; i = xml.find('<', i + 1)) {
+        size_t end = xml.find('>', i);
+        if (end == std::string::npos) break;
+        std::string tag = xml.substr(i + 1, end - i - 1);
+        if (tag.empty() || tag[0] == '?' || tag[0] == '!') continue;
+        bool closing = tag[0] == '/';
+        size_t nameEnd = tag.find_first_of(" \t\r\n/");
+        std::string name = tag.substr(closing ? 1 : 0, nameEnd == std::string::npos ? std::string::npos : nameEnd - (closing ? 1 : 0));
+        auto attrs = XmlAttributes(tag);
+        double parentOpacity = groups.empty() ? 1.0 : groups.back().opacity;
+        bool parentVisible = groups.empty() ? true : groups.back().visible;
+        if (name == "image" && !closing) {
+            w = atoi(XmlAttr(attrs, "w", "0").c_str());
+            h = atoi(XmlAttr(attrs, "h", "0").c_str());
+        } else if (name == "stack") {
+            if (closing) { if (!groups.empty()) groups.pop_back(); }
+            else if (tag.back() != '/') {
+                groups.push_back({ parentOpacity * atof(XmlAttr(attrs, "opacity", "1").c_str()),
+                                   parentVisible && XmlAttr(attrs, "visibility", "visible") != "hidden" });
+            }
+        } else if (name == "layer" && !closing) {
+            OraLayer l;
+            l.name = FromUtf8(XmlAttr(attrs, "name", ""));
+            double op = parentOpacity * atof(XmlAttr(attrs, "opacity", "1").c_str());
+            l.opacity = max(0, min(100, (int)(op * 100.0 + 0.5)));
+            l.visible = parentVisible && XmlAttr(attrs, "visibility", "visible") != "hidden";
+            l.blend = OraBlendFromOp(XmlAttr(attrs, "composite-op", "svg:src-over"));
+            l.locked = XmlAttr(attrs, "edit-locked") == "true";
+            l.selected = XmlAttr(attrs, "selected") == "true";
+            // The layer's PNG, and where it sits on the image (it may be smaller)
+            Placed p;
+            p.x = atoi(XmlAttr(attrs, "x", "0").c_str());
+            p.y = atoi(XmlAttr(attrs, "y", "0").c_str());
+            std::string src = XmlAttr(attrs, "src");
+            std::vector<uint8_t> png;
+            if (!src.empty() && zip.extract(src, png)) DecodeImageBytes(png, p.part);   // an SVG or missing layer stays empty
+            topFirst.push_back(std::move(l));
+            parts.push_back(std::move(p));
+        }
+    }
+    if (w <= 0 || h <= 0 || w > 32767 || h > 32767 || topFirst.empty()) return false;
+
+    // Each layer at the image's full size, bottom first
+    layers.clear();
+    for (size_t k = topFirst.size(); k-- > 0;) {
+        OraLayer l = std::move(topFirst[k]);
+        const Placed& p = parts[k];
+        l.img.w = w; l.img.h = h; l.img.premultiplied = false;
+        l.img.px.assign((size_t)w * h * 4, 0);
+        for (int y = 0; y < p.part.h; y++) {
+            int ty = p.y + y;
+            if (ty < 0 || ty >= h) continue;
+            int x0 = max(0, -p.x), x1 = min(p.part.w, w - p.x);
+            if (x1 <= x0) continue;
+            memcpy(&l.img.px[((size_t)ty * w + p.x + x0) * 4], &p.part.px[((size_t)y * p.part.w + x0) * 4], (size_t)(x1 - x0) * 4);
+        }
+        layers.push_back(std::move(l));
+    }
+    return true;
+}
+
+// Makes decoded .ora layers the current document. False if out of memory.
+static bool InstallOraDocument(const wchar_t* path, std::vector<OraLayer>& layers, bool callerFits)
+{
+    int n = (int)layers.size();
+    std::vector<Bitmap*> bmps;
+    for (auto& l : layers) {
+        Bitmap* b = MakeBitmapFromPixels(l.img);   // straight-alpha ARGB, as the canvas is
+        std::vector<BYTE>().swap(l.img.px);
+        if (!b) { for (auto* x : bmps) delete x; return false; }
+        bmps.push_back(b);
+    }
+    // The layer the file had selected is active, or else the top one
+    int active = n - 1;
+    for (int i = 0; i < n; i++) if (layers[i].selected) active = i;
+
+    // The active layer goes in as the canvas, the way any image opens...
+    InstallCanvasImage(bmps[active], path, false, true, 1.0f, callerFits);
+    if (g_pCanvas != bmps[active]) {   // it ran out of memory and said so
+        for (int i = 0; i < n; i++) if (i != active) delete bmps[i];
+        return true;
+    }
+    // ...and the rest join it
+    g_layers.clear();
+    for (int i = 0; i < n; i++) {
+        Layer l;
+        l.name    = layers[i].name.empty() ? L"Layer " + std::to_wstring(i + 1) : layers[i].name;
+        l.bmp     = i == active ? nullptr : bmps[i];
+        l.visible = layers[i].visible;
+        l.opacity = layers[i].opacity;
+        l.blend   = layers[i].blend;
+        l.locked  = layers[i].locked;
+        g_layers.push_back(l);
+    }
+    g_activeLayer = active;
+    g_layerNameCounter = n + 1;
+    g_layerStackGen++;
+    InvalidateCanvas();
+    LayersPanelSync();
+    return true;
+}
+
+// Opens an .ora straight away, for the paths that don't load in the background
+static void LoadOraNow(const wchar_t* path)
+{
+    int w = 0, h = 0;
+    std::vector<OraLayer> layers;
+    HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    bool ok = DecodeOra(path, w, h, layers) && InstallOraDocument(path, layers, false);
+    SetCursor(old);
+    if (!ok) MessageBox(g_hwndMain, L"Could not open this OpenRaster (.ora) file.", APP_TITLE, MB_ICONERROR);
+}
+
+// The picture an .ora shows, for thumbnails: its merged image, or its thumbnail
+static Bitmap* LoadOraMergedBitmap(const wchar_t* path)
+{
+    std::vector<uint8_t> bytes, png;
+    Zip::Reader zip;
+    if (!ReadWholeFile(path, bytes) || !zip.open(std::move(bytes))) return nullptr;
+    if (zip.extract("mergedimage.png", png) || zip.extract("Thumbnails/thumbnail.png", png)) {
+        DecodedImage img;
+        return DecodeImageBytes(png, img) ? MakeBitmapFromPixels(img) : nullptr;
+    }
+    // Older files may have neither: combine the layers
+    int w = 0, h = 0;
+    std::vector<OraLayer> layers;
+    if (!DecodeOra(path, w, h, layers)) return nullptr;
+    Bitmap* out = FlatNewBitmap(w, h);
+    if (!out) return nullptr;
+    for (auto& l : layers) {
+        if (!l.visible || l.opacity <= 0) continue;
+        Bitmap* b = MakeBitmapFromPixels(l.img);
+        if (!b) continue;
+        if (l.blend == BlendMode::Normal) FlatDrawNormal(out, b, l.opacity, w, h);
+        else BlendBitmapOnto(out, b, l.blend, l.opacity);
+        delete b;
+    }
+    return out;
+}
+
 // ─── Background image loading ────────────────────────────────────────────────
 // Opening a file decodes it on a worker thread while the canvas shows a
 // spinner instead of the old image. One decode runs at a time: a request made
@@ -2358,6 +2770,8 @@ struct AsyncImageLoad {
     bool ok = false;
     HRESULT hr = S_OK;        // WIC failure, to explain missing HEIC/AVIF codecs
     DecodedImage img;
+    bool isOra = false;       // an OpenRaster file: its layers instead of img
+    std::vector<OraLayer> ora;
 };
 static bool         g_loadThreadBusy = false;
 static bool         g_hasQueuedLoad  = false;
@@ -2382,7 +2796,11 @@ static void StartLoadThread(const std::wstring& path, bool fromStrip)
         const wchar_t* p   = req->path.c_str();
         const wchar_t* dot = wcsrchr(p, L'.');
         try {
-            if (IsSvgPath(p))
+            if (IsOraPath(p)) {
+                int w = 0, h = 0;
+                req->isOra = true;
+                req->ok = DecodeOra(p, w, h, req->ora);
+            } else if (IsSvgPath(p))
                 req->ok = DecodeSvgPixels(p, 1.0f, req->img);
             else if (dot && _wcsicmp(dot + 1, L"webp") == 0)
                 req->ok = DecodeWebPPixels(p, req->img);
@@ -2434,9 +2852,12 @@ static void FinishImageLoad(AsyncImageLoad* r)
     // Repaint the strip so its paused thumbnail loading resumes
     if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, FALSE);
 
-    Bitmap* bmp = req->ok ? MakeBitmapFromPixels(req->img) : nullptr;
+    Bitmap* bmp = req->ok && !req->isOra ? MakeBitmapFromPixels(req->img) : nullptr;
     std::vector<BYTE>().swap(req->img.px);
-    if (bmp)
+    if (req->isOra) {
+        if (!req->ok || !InstallOraDocument(req->path.c_str(), req->ora, req->fromStrip))
+            MessageBox(g_hwndMain, L"Could not open this OpenRaster (.ora) file.", APP_TITLE, MB_ICONERROR);
+    } else if (bmp)
         InstallCanvasImage(bmp, req->path.c_str(), IsSvgPath(req->path.c_str()), true, req->img.scale, req->fromStrip);
     else if (IsStoreCodecPath(req->path.c_str()))
         ShowStoreCodecHelp(req->path.c_str(), req->hr);   // GDI+ can't read these either
@@ -2472,7 +2893,7 @@ static void DoOpen()
     OPENFILENAME ofn = {};
     ofn.lStructSize    = sizeof(ofn);
     ofn.hwndOwner      = g_hwndMain;
-    ofn.lpstrFilter    = L"Image Files\0*.png;*.bmp;*.jpg;*.jpeg;*.gif;*.tif;*.tiff;*.webp;*.svg;*.heic;*.heif;*.hif;*.avif\0All Files\0*.*\0";
+    ofn.lpstrFilter    = L"Image Files\0*.png;*.bmp;*.jpg;*.jpeg;*.gif;*.tif;*.tiff;*.webp;*.svg;*.heic;*.heif;*.hif;*.avif;*.ora\0All Files\0*.*\0";
     ofn.lpstrFile      = file;
     ofn.nMaxFile       = MAX_PATH;
     ofn.lpstrInitialDir = initDir[0] ? initDir : nullptr;
@@ -2486,7 +2907,7 @@ static void DoOpen()
 // PNG data under the wrong extension, destroying the original file.
 static bool IsSaveableImagePath(const wchar_t* path)
 {
-    static const wchar_t* k[] = { L"png", L"jpg", L"jpeg", L"bmp", L"gif", L"tif", L"tiff", L"webp" };
+    static const wchar_t* k[] = { L"png", L"jpg", L"jpeg", L"bmp", L"gif", L"tif", L"tiff", L"webp", L"ora" };
     const wchar_t* dot = wcsrchr(path, L'.');
     if (dot) for (auto e : k) if (_wcsicmp(dot + 1, e) == 0) return true;
     return false;
@@ -2496,13 +2917,15 @@ static void SaveToFile(const wchar_t* filepath)
 {
     if (!IsSaveableImagePath(filepath)) {
         MessageBox(g_hwndMain,
-                   L"MyPaint can save PNG, JPEG, BMP, GIF, TIFF and WebP images.\n"
+                   L"MyPaint can save PNG, JPEG, BMP, GIF, TIFF and WebP images, and\n"
+                   L"OpenRaster (.ora) files, which keep the layers.\n"
                    L"Please choose one of those file types.",
                    APP_TITLE, MB_ICONWARNING);
         return;
     }
+    bool isOra = IsOraPath(filepath);
     if (!AnimConfirmSave(filepath)) return;
-    if (!LayersConfirmFlatten(filepath)) return;
+    if (!isOra && !LayersConfirmFlatten(filepath)) return;
     const wchar_t* dot = wcsrchr(filepath, L'.');
     bool isWebP = dot && _wcsicmp(dot + 1, L"webp") == 0;
 
@@ -2510,7 +2933,9 @@ static void SaveToFile(const wchar_t* filepath)
     // Large images can take seconds (lossless WebP above all)
     HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
     bool ok;
-    if (isWebP) {
+    if (isOra) {
+        ok = SaveOra(filepath);
+    } else if (isWebP) {
         ok = SaveWebP(filepath);
     } else if (isJpeg) {
         ok = SaveJpeg(FlattenedCanvas(true), g_jpegQuality, filepath);
@@ -2836,7 +3261,8 @@ static void DoSaveAs()
     ofn.lStructSize  = sizeof(ofn);
     ofn.hwndOwner    = g_hwndMain;
     ofn.lpstrFilter  = L"PNG Image\0*.png\0JPEG Image\0*.jpg;*.jpeg\0WebP Image\0*.webp\0"
-                       L"GIF Image\0*.gif\0TIFF Image\0*.tif;*.tiff\0BMP Image\0*.bmp\0All Files\0*.*\0";
+                       L"GIF Image\0*.gif\0TIFF Image\0*.tif;*.tiff\0BMP Image\0*.bmp\0"
+                       L"OpenRaster, keeps layers\0*.ora\0All Files\0*.*\0";
     // Default filter/extension to match the currently open file type
     const wchar_t* curDot = wcsrchr(g_currentFile, L'.');
     DWORD filterIndex = 1;
@@ -2848,6 +3274,7 @@ static void DoSaveAs()
         else if (_wcsicmp(e, L"gif") == 0)                              { filterIndex = 4; defExt = L"gif"; }
         else if (_wcsicmp(e, L"tif") == 0 || _wcsicmp(e, L"tiff") == 0) { filterIndex = 5; defExt = L"tif"; }
         else if (_wcsicmp(e, L"bmp") == 0)                              { filterIndex = 6; defExt = L"bmp"; }
+        else if (_wcsicmp(e, L"ora") == 0)                              { filterIndex = 7; defExt = L"ora"; }
     }
     ofn.nFilterIndex = filterIndex;
     ofn.lpstrFile    = file;
@@ -3603,7 +4030,7 @@ static bool IsImageExtension(const wchar_t* ext)
 {
     static const wchar_t* k[] = {
         L"png", L"jpg", L"jpeg", L"bmp", L"gif",
-        L"tif", L"tiff", L"webp", L"svg",
+        L"tif", L"tiff", L"webp", L"svg", L"ora",
         L"heic", L"heif", L"hif", L"avif"   // need Windows' Store codecs
     };
     for (auto e : k) if (_wcsicmp(ext, e) == 0) return true;
@@ -3920,6 +4347,8 @@ static Bitmap* MakeFolderThumb(const wchar_t* path)
     Bitmap* src = nullptr;
     if (dot && _wcsicmp(dot+1, L"webp") == 0) {
         src = LoadWebP(path);
+    } else if (dot && _wcsicmp(dot+1, L"ora") == 0) {
+        src = LoadOraMergedBitmap(path);
     } else if (dot && _wcsicmp(dot+1, L"svg") == 0) {
         // Render SVG at small size directly to avoid large rasterization
         HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,

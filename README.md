@@ -30,8 +30,12 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   Screen, Overlay, Difference, Color and the rest of the 16 that SVG, CSS and
   Inkscape use). The blending lives in its own `Img` class (`Img.h`,
   `Img.cpp`), plain loops over red, green, blue and alpha planes, meant to be
-  read and edited by hand. Saving flattens for now, since PNG, JPEG and the
-  others hold one picture, and MyPaint says so the first time.
+  read and edited by hand. Saving as **OpenRaster (.ora)** keeps the layers
+  with their names, opacity, visibility, blend modes and locks; GIMP, Krita and
+  others open it too, and MyPaint opens theirs. The zip reading and writing
+  behind it is MyPaint's own, in `Zip.h` and `Zip.cpp`. Saving as PNG, JPEG
+  and the others flattens, since they hold one picture, and MyPaint says so
+  the first time.
 - **Animated GIF and WebP:** play by themselves, with a bar above the folder
   browser: play/pause (Space), step a frame (`,` and `.`), and a track to drag.
   MyPaint can't save animations yet: editing or saving works on the frame
