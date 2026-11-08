@@ -134,6 +134,7 @@
     <ClCompile Include="MyPaint.cpp" />
     <ClCompile Include="Img.cpp" />
     <ClCompile Include="Zip.cpp" />
+    <ClCompile Include="Heif.cpp" />
   </ItemGroup>
 
   <!-- Header files -->
@@ -141,6 +142,7 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="Img.h" />
     <ClInclude Include="Zip.h" />
+    <ClInclude Include="Heif.h" />
   </ItemGroup>
 
   <!-- Resource files -->

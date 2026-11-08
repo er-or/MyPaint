@@ -71,6 +71,7 @@ using std::min;
 #include "resource.h"
 #include "Img.h"
 #include "Zip.h"
+#include "Heif.h"
 
 // ============================================================
 //  Constants
@@ -2228,12 +2229,12 @@ static Bitmap* LoadSvgToBitmap(const wchar_t* path, float scale, float* pScaleUs
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void LoadOraNow(const wchar_t* path);
-static bool IsOraPath(const wchar_t* p);
+static void LoadLayeredNow(const wchar_t* path);
+static bool IsLayeredPath(const wchar_t* p);
 
 static void LoadImageFromPath(const wchar_t* file)
 {
-    if (IsOraPath(file)) { LoadOraNow(file); return; }
+    if (IsLayeredPath(file)) { LoadLayeredNow(file); return; }
     const wchar_t* dot = wcsrchr(file, L'.');
     bool isWebP = dot && _wcsicmp(dot + 1, L"webp") == 0;
     bool isSVG  = dot && _wcsicmp(dot + 1, L"svg")  == 0;
@@ -2250,8 +2251,10 @@ static void LoadImageFromPath(const wchar_t* file)
         HRESULT hrWebP = S_OK;
         const wchar_t* webpStep = nullptr;
         bmp = isWebP ? LoadWebP(file, &hrWebP, &webpStep) : Bitmap::FromFile(file);
-        if (!isWebP && bmp && bmp->GetLastStatus() == Ok) ApplyExifOrientation(bmp, file);
-        if (!isWebP && (!bmp || bmp->GetLastStatus() != Ok)) {
+        // GetLastStatus clears the error as it reports it, so ask once and keep the answer
+        bool gdipOk = bmp && bmp->GetLastStatus() == Ok;
+        if (!isWebP && gdipOk) ApplyExifOrientation(bmp, file);
+        if (!isWebP && !gdipOk) {
             // GDI+ can't read HEIC, AVIF and some others; Windows' WIC codecs can
             delete bmp;
             DecodedImage img;
@@ -2588,7 +2591,7 @@ static bool SaveOra(const wchar_t* file)
 }
 
 // One layer read from an .ora, at the image's full size
-struct OraLayer {
+struct LoadedLayer {
     std::wstring name;
     bool visible = true;
     int opacity = 100;
@@ -2599,7 +2602,7 @@ struct OraLayer {
 };
 
 // Reads an .ora into its layers, bottom first. Runs on the loading thread.
-static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<OraLayer>& layers)
+static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<LoadedLayer>& layers)
 {
     std::vector<uint8_t> bytes;
     Zip::Reader zip;
@@ -2611,7 +2614,7 @@ static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<OraLayer>
     struct Group { double opacity; bool visible; };
     struct Placed { int x = 0, y = 0; DecodedImage part; };
     std::vector<Group> groups;
-    std::vector<OraLayer> topFirst;
+    std::vector<LoadedLayer> topFirst;
     std::vector<Placed> parts;   // beside topFirst
     w = h = 0;
     for (size_t i = xml.find('<'); i != std::string::npos; i = xml.find('<', i + 1)) {
@@ -2635,7 +2638,7 @@ static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<OraLayer>
                                    parentVisible && XmlAttr(attrs, "visibility", "visible") != "hidden" });
             }
         } else if (name == "layer" && !closing) {
-            OraLayer l;
+            LoadedLayer l;
             l.name = FromUtf8(XmlAttr(attrs, "name", ""));
             double op = parentOpacity * atof(XmlAttr(attrs, "opacity", "1").c_str());
             l.opacity = max(0, min(100, (int)(op * 100.0 + 0.5)));
@@ -2659,7 +2662,7 @@ static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<OraLayer>
     // Each layer at the image's full size, bottom first
     layers.clear();
     for (size_t k = topFirst.size(); k-- > 0;) {
-        OraLayer l = std::move(topFirst[k]);
+        LoadedLayer l = std::move(topFirst[k]);
         const Placed& p = parts[k];
         l.img.w = w; l.img.h = h; l.img.premultiplied = false;
         l.img.px.assign((size_t)w * h * 4, 0);
@@ -2675,8 +2678,80 @@ static bool DecodeOra(const wchar_t* path, int& w, int& h, std::vector<OraLayer>
     return true;
 }
 
-// Makes decoded .ora layers the current document. False if out of memory.
-static bool InstallOraDocument(const wchar_t* path, std::vector<OraLayer>& layers, bool callerFits)
+// ─── Windows Paint (.paint) ──────────────────────────────────────────────────
+// Paint's layered files are HEIF with uncompressed layers; Heif.h reads them.
+// They hold no layer names, opacity or visibility, so the layers are numbered.
+// The file's canvas colour (white in Paint's files) becomes a Background layer
+// under them, so the picture looks as it does in Paint.
+
+static bool IsPaintPath(const wchar_t* p)
+{
+    const wchar_t* dot = wcsrchr(p, L'.');
+    return dot && _wcsicmp(dot + 1, L"paint") == 0;
+}
+
+static bool IsLayeredPath(const wchar_t* p) { return IsOraPath(p) || IsPaintPath(p); }
+
+static bool DecodePaint(const wchar_t* path, int& w, int& h, std::vector<LoadedLayer>& layers)
+{
+    std::vector<uint8_t> bytes;
+    Heif::Picture pic;
+    if (!ReadWholeFile(path, bytes) || !Heif::readLayers(bytes, pic)) return false;
+    w = pic.w; h = pic.h;
+    layers.clear();
+    if (pic.fill[3] > 0) {
+        LoadedLayer bg;
+        bg.name = L"Background";
+        bg.img.w = w; bg.img.h = h;
+        bg.img.px.resize((size_t)w * h * 4);
+        for (size_t p = 0; p < (size_t)w * h; p++) {   // BGRA
+            bg.img.px[p * 4 + 0] = pic.fill[2];
+            bg.img.px[p * 4 + 1] = pic.fill[1];
+            bg.img.px[p * 4 + 2] = pic.fill[0];
+            bg.img.px[p * 4 + 3] = pic.fill[3];
+        }
+        layers.push_back(std::move(bg));
+    }
+    for (size_t k = 0; k < pic.layers.size(); k++) {
+        const Heif::Layer& src = pic.layers[k];
+        LoadedLayer l;
+        l.name = L"Layer " + std::to_wstring(k + 1);
+        l.img.w = w; l.img.h = h;
+        l.img.px.assign((size_t)w * h * 4, 0);
+        // Placed at its offset, red-green-blue-alpha turned to the canvas's blue-green-red-alpha
+        for (int y = 0; y < src.h; y++) {
+            int ty = src.y + y;
+            if (ty < 0 || ty >= h) continue;
+            for (int x = 0; x < src.w; x++) {
+                int tx = src.x + x;
+                if (tx < 0 || tx >= w) continue;
+                const uint8_t* s = &src.rgba[((size_t)y * src.w + x) * 4];
+                uint8_t* t = &l.img.px[((size_t)ty * w + tx) * 4];
+                t[0] = s[2]; t[1] = s[1]; t[2] = s[0]; t[3] = s[3];
+            }
+        }
+        layers.push_back(std::move(l));
+    }
+    if (!layers.empty()) layers.back().selected = true;   // the top one, as Paint does
+    return true;
+}
+
+// .ora or .paint into layers, bottom first
+static bool DecodeLayeredFile(const wchar_t* path, int& w, int& h, std::vector<LoadedLayer>& layers)
+{
+    return IsPaintPath(path) ? DecodePaint(path, w, h, layers) : DecodeOra(path, w, h, layers);
+}
+
+static void LayeredOpenFailed(const wchar_t* path)
+{
+    MessageBox(g_hwndMain, IsPaintPath(path)
+        ? L"Could not open this Windows Paint (.paint) file. MyPaint reads Paint's layered pictures; "
+          L"this one may use a kind of picture data it doesn't know yet."
+        : L"Could not open this OpenRaster (.ora) file.", APP_TITLE, MB_ICONERROR);
+}
+
+// Makes decoded layers (.ora or .paint) the current document. False if out of memory.
+static bool InstallLayeredDocument(const wchar_t* path, std::vector<LoadedLayer>& layers, bool callerFits)
 {
     int n = (int)layers.size();
     std::vector<Bitmap*> bmps;
@@ -2717,30 +2792,33 @@ static bool InstallOraDocument(const wchar_t* path, std::vector<OraLayer>& layer
 }
 
 // Opens an .ora straight away, for the paths that don't load in the background
-static void LoadOraNow(const wchar_t* path)
+static void LoadLayeredNow(const wchar_t* path)
 {
     int w = 0, h = 0;
-    std::vector<OraLayer> layers;
+    std::vector<LoadedLayer> layers;
     HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
-    bool ok = DecodeOra(path, w, h, layers) && InstallOraDocument(path, layers, false);
+    bool ok = DecodeLayeredFile(path, w, h, layers) && InstallLayeredDocument(path, layers, false);
     SetCursor(old);
-    if (!ok) MessageBox(g_hwndMain, L"Could not open this OpenRaster (.ora) file.", APP_TITLE, MB_ICONERROR);
+    if (!ok) LayeredOpenFailed(path);
 }
 
-// The picture an .ora shows, for thumbnails: its merged image, or its thumbnail
-static Bitmap* LoadOraMergedBitmap(const wchar_t* path)
+// The picture a layered file shows, for thumbnails: an .ora's merged image or
+// thumbnail when it has one, otherwise its layers combined
+static Bitmap* LoadLayeredThumbBitmap(const wchar_t* path)
 {
-    std::vector<uint8_t> bytes, png;
-    Zip::Reader zip;
-    if (!ReadWholeFile(path, bytes) || !zip.open(std::move(bytes))) return nullptr;
-    if (zip.extract("mergedimage.png", png) || zip.extract("Thumbnails/thumbnail.png", png)) {
-        DecodedImage img;
-        return DecodeImageBytes(png, img) ? MakeBitmapFromPixels(img) : nullptr;
+    if (IsOraPath(path)) {
+        std::vector<uint8_t> bytes, png;
+        Zip::Reader zip;
+        if (!ReadWholeFile(path, bytes) || !zip.open(std::move(bytes))) return nullptr;
+        if (zip.extract("mergedimage.png", png) || zip.extract("Thumbnails/thumbnail.png", png)) {
+            DecodedImage img;
+            return DecodeImageBytes(png, img) ? MakeBitmapFromPixels(img) : nullptr;
+        }
     }
-    // Older files may have neither: combine the layers
+    // A .paint, or an older .ora with neither: combine the layers
     int w = 0, h = 0;
-    std::vector<OraLayer> layers;
-    if (!DecodeOra(path, w, h, layers)) return nullptr;
+    std::vector<LoadedLayer> layers;
+    if (!DecodeLayeredFile(path, w, h, layers)) return nullptr;
     Bitmap* out = FlatNewBitmap(w, h);
     if (!out) return nullptr;
     for (auto& l : layers) {
@@ -2770,8 +2848,8 @@ struct AsyncImageLoad {
     bool ok = false;
     HRESULT hr = S_OK;        // WIC failure, to explain missing HEIC/AVIF codecs
     DecodedImage img;
-    bool isOra = false;       // an OpenRaster file: its layers instead of img
-    std::vector<OraLayer> ora;
+    bool isLayered = false;   // .ora or .paint: its layers instead of img
+    std::vector<LoadedLayer> layers;
 };
 static bool         g_loadThreadBusy = false;
 static bool         g_hasQueuedLoad  = false;
@@ -2796,10 +2874,10 @@ static void StartLoadThread(const std::wstring& path, bool fromStrip)
         const wchar_t* p   = req->path.c_str();
         const wchar_t* dot = wcsrchr(p, L'.');
         try {
-            if (IsOraPath(p)) {
+            if (IsLayeredPath(p)) {
                 int w = 0, h = 0;
-                req->isOra = true;
-                req->ok = DecodeOra(p, w, h, req->ora);
+                req->isLayered = true;
+                req->ok = DecodeLayeredFile(p, w, h, req->layers);
             } else if (IsSvgPath(p))
                 req->ok = DecodeSvgPixels(p, 1.0f, req->img);
             else if (dot && _wcsicmp(dot + 1, L"webp") == 0)
@@ -2852,11 +2930,11 @@ static void FinishImageLoad(AsyncImageLoad* r)
     // Repaint the strip so its paused thumbnail loading resumes
     if (g_hwndFolderBrowser) InvalidateRect(g_hwndFolderBrowser, NULL, FALSE);
 
-    Bitmap* bmp = req->ok && !req->isOra ? MakeBitmapFromPixels(req->img) : nullptr;
+    Bitmap* bmp = req->ok && !req->isLayered ? MakeBitmapFromPixels(req->img) : nullptr;
     std::vector<BYTE>().swap(req->img.px);
-    if (req->isOra) {
-        if (!req->ok || !InstallOraDocument(req->path.c_str(), req->ora, req->fromStrip))
-            MessageBox(g_hwndMain, L"Could not open this OpenRaster (.ora) file.", APP_TITLE, MB_ICONERROR);
+    if (req->isLayered) {
+        if (!req->ok || !InstallLayeredDocument(req->path.c_str(), req->layers, req->fromStrip))
+            LayeredOpenFailed(req->path.c_str());
     } else if (bmp)
         InstallCanvasImage(bmp, req->path.c_str(), IsSvgPath(req->path.c_str()), true, req->img.scale, req->fromStrip);
     else if (IsStoreCodecPath(req->path.c_str()))
@@ -2893,7 +2971,7 @@ static void DoOpen()
     OPENFILENAME ofn = {};
     ofn.lStructSize    = sizeof(ofn);
     ofn.hwndOwner      = g_hwndMain;
-    ofn.lpstrFilter    = L"Image Files\0*.png;*.bmp;*.jpg;*.jpeg;*.gif;*.tif;*.tiff;*.webp;*.svg;*.heic;*.heif;*.hif;*.avif;*.ora\0All Files\0*.*\0";
+    ofn.lpstrFilter    = L"Image Files\0*.png;*.bmp;*.jpg;*.jpeg;*.gif;*.tif;*.tiff;*.webp;*.svg;*.heic;*.heif;*.hif;*.avif;*.ora;*.paint\0All Files\0*.*\0";
     ofn.lpstrFile      = file;
     ofn.nMaxFile       = MAX_PATH;
     ofn.lpstrInitialDir = initDir[0] ? initDir : nullptr;
@@ -3245,8 +3323,10 @@ static void DoSaveAs()
 {
     wchar_t file[MAX_PATH] = {};
     if (g_currentFile[0] != L'\0') StringCchCopy(file, MAX_PATH, g_currentFile);
-    // Suggest a PNG beside an SVG (or other unwritable file) rather than its own name
-    if (file[0] && !IsSaveableImagePath(file)) PathRenameExtensionW(file, L".png");
+    // Suggest a PNG beside an SVG (or other unwritable file) rather than its own
+    // name, or an .ora when there are layers to keep (a Windows Paint file)
+    const wchar_t* suggestExt = g_layers.size() > 1 ? L".ora" : L".png";
+    if (file[0] && !IsSaveableImagePath(file)) PathRenameExtensionW(file, suggestExt);
     // Open in the image's own folder: given a full path in lpstrFile, the
     // dialog may still start in the last folder used instead
     wchar_t initDir[MAX_PATH] = {};
@@ -3254,7 +3334,7 @@ static void DoSaveAs()
         StringCchCopy(initDir, MAX_PATH, file);
         PathRemoveFileSpecW(initDir);
         StringCchCopy(file, MAX_PATH, PathFindFileNameW(g_currentFile));
-        if (!IsSaveableImagePath(file)) PathRenameExtensionW(file, L".png");
+        if (!IsSaveableImagePath(file)) PathRenameExtensionW(file, suggestExt);
     }
     OPENFILENAME ofn = {};
     ofn.lpstrInitialDir = initDir[0] ? initDir : nullptr;
@@ -3276,6 +3356,7 @@ static void DoSaveAs()
         else if (_wcsicmp(e, L"bmp") == 0)                              { filterIndex = 6; defExt = L"bmp"; }
         else if (_wcsicmp(e, L"ora") == 0)                              { filterIndex = 7; defExt = L"ora"; }
     }
+    if (g_currentFile[0] && !IsSaveableImagePath(g_currentFile) && g_layers.size() > 1) { filterIndex = 7; defExt = L"ora"; }
     ofn.nFilterIndex = filterIndex;
     ofn.lpstrFile    = file;
     ofn.nMaxFile     = MAX_PATH;
@@ -4030,7 +4111,7 @@ static bool IsImageExtension(const wchar_t* ext)
 {
     static const wchar_t* k[] = {
         L"png", L"jpg", L"jpeg", L"bmp", L"gif",
-        L"tif", L"tiff", L"webp", L"svg", L"ora",
+        L"tif", L"tiff", L"webp", L"svg", L"ora", L"paint",
         L"heic", L"heif", L"hif", L"avif"   // need Windows' Store codecs
     };
     for (auto e : k) if (_wcsicmp(ext, e) == 0) return true;
@@ -4347,8 +4428,8 @@ static Bitmap* MakeFolderThumb(const wchar_t* path)
     Bitmap* src = nullptr;
     if (dot && _wcsicmp(dot+1, L"webp") == 0) {
         src = LoadWebP(path);
-    } else if (dot && _wcsicmp(dot+1, L"ora") == 0) {
-        src = LoadOraMergedBitmap(path);
+    } else if (IsLayeredPath(path)) {
+        src = LoadLayeredThumbBitmap(path);
     } else if (dot && _wcsicmp(dot+1, L"svg") == 0) {
         // Render SVG at small size directly to avoid large rasterization
         HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,

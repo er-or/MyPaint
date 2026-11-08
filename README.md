@@ -33,7 +33,9 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   read and edited by hand. Saving as **OpenRaster (.ora)** keeps the layers
   with their names, opacity, visibility, blend modes and locks; GIMP, Krita and
   others open it too, and MyPaint opens theirs. The zip reading and writing
-  behind it is MyPaint's own, in `Zip.h` and `Zip.cpp`. Saving as PNG, JPEG
+  behind it is MyPaint's own, in `Zip.h` and `Zip.cpp`. Windows Paint's
+  layered **.paint** files open too, each layer as its own (read by `Heif.h`
+  and `Heif.cpp`); save them as .ora to keep the layers. Saving as PNG, JPEG
   and the others flattens, since they hold one picture, and MyPaint says so
   the first time.
 - **Animated GIF and WebP:** play by themselves, with a bar above the folder
