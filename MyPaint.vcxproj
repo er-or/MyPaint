@@ -133,6 +133,8 @@
   <ItemGroup>
     <ClCompile Include="MyPaint.cpp" />
     <ClCompile Include="Img.cpp" />
+    <ClCompile Include="ImgAdjust.cpp" />
+    <ClCompile Include="ImgFilter.cpp" />
     <ClCompile Include="Zip.cpp" />
     <ClCompile Include="Heif.cpp" />
   </ItemGroup>

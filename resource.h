@@ -87,6 +87,26 @@
 #define ID_IMAGE_FLIP_V         40405
 #define ID_IMAGE_CROP           40406
 
+// Menu item IDs — Image > Adjust and Image > Filters (built in code, see BuildEffectMenus)
+#define ID_ADJ_BRIGHTNESS       40420
+#define ID_ADJ_HUESAT           40421
+#define ID_ADJ_LEVELS           40422
+#define ID_ADJ_THRESHOLD        40423
+#define ID_ADJ_POSTERIZE        40424
+#define ID_ADJ_INVERT           40425
+#define ID_ADJ_GRAY             40426
+#define ID_ADJ_SEPIA            40427
+#define ID_ADJ_AUTOLEVEL        40428
+#define ID_ADJ_EQUALIZE         40429
+#define ID_FX_BLUR              40440
+#define ID_FX_SHARPEN           40441
+#define ID_FX_EDGES             40442
+#define ID_FX_EMBOSS            40443
+#define ID_FX_MOTION            40444
+#define ID_FX_KERNEL            40445
+#define ID_FX_NOISE             40446
+#define ID_FX_PIXELATE          40447
+
 // Menu item IDs — Help
 #define ID_HELP_ABOUT           40020
 

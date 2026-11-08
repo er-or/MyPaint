@@ -8172,6 +8172,691 @@ static void DoFlipCanvas(bool horizontal)
 }
 
 // ============================================================
+//  Adjust and Filters menus
+// ============================================================
+// The image processing itself is in the Img class (ImgAdjust.cpp and
+// ImgFilter.cpp). This part picks the pixels to work on, shows a live preview
+// while a dialog is open, and records the undo step.
+//
+// Adjust and Filters are submenus at the bottom of the Image menu (the main
+// menu owns them, so destroying it destroys them).
+
+static void BuildEffectMenus()
+{
+    HMENU hImg = g_hMenuMain ? GetSubMenu(g_hMenuMain, 2) : NULL;
+    if (!hImg) return;
+    HMENU hAdjust = CreatePopupMenu();
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_BRIGHTNESS, L"&Brightness / Contrast...");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_HUESAT,     L"&Hue / Saturation...");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_LEVELS,     L"&Levels...");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_THRESHOLD,  L"&Threshold...");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_POSTERIZE,  L"&Posterize...");
+    AppendMenuW(hAdjust, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_AUTOLEVEL,  L"&Auto Level");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_EQUALIZE,   L"&Equalize");
+    AppendMenuW(hAdjust, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_INVERT,     L"&Invert Colors");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_GRAY,       L"&Grayscale");
+    AppendMenuW(hAdjust, MF_STRING, ID_ADJ_SEPIA,      L"&Sepia");
+
+    HMENU hFilters = CreatePopupMenu();
+    AppendMenuW(hFilters, MF_STRING, ID_FX_BLUR,     L"&Blur...");
+    AppendMenuW(hFilters, MF_STRING, ID_FX_MOTION,   L"&Motion Blur...");
+    AppendMenuW(hFilters, MF_STRING, ID_FX_SHARPEN,  L"&Sharpen...");
+    AppendMenuW(hFilters, MF_STRING, ID_FX_EDGES,    L"&Edge Detect...");
+    AppendMenuW(hFilters, MF_STRING, ID_FX_EMBOSS,   L"E&mboss...");
+    AppendMenuW(hFilters, MF_STRING, ID_FX_KERNEL,   L"&Custom Kernel...");
+    AppendMenuW(hFilters, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hFilters, MF_STRING, ID_FX_NOISE,    L"Add &Noise...");
+    AppendMenuW(hFilters, MF_STRING, ID_FX_PIXELATE, L"&Pixelate...");
+
+    AppendMenuW(hImg, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hImg, MF_POPUP, (UINT_PTR)hAdjust,  L"&Adjust");
+    AppendMenuW(hImg, MF_POPUP, (UINT_PTR)hFilters, L"Filte&rs");
+}
+
+// ── The pixels being worked on ──────────────────────────────────────────
+// The active layer, or the floating selection when there is one; only the
+// selected part when something is selected.
+struct FxArea {
+    Bitmap* bmp = nullptr;
+    bool    floating = false;   // the floating selection: no undo step of its own, as when flipping it
+    RECT    inner = {};         // the pixels that change, in bmp's coordinates
+    RECT    outer = {};         // inner plus a margin, so filters see the neighbours just outside
+    Img     before;             // outer's pixels as they were
+    std::vector<BYTE> mask;     // inner-sized, 1 = selected; empty when the whole rectangle changes
+};
+static FxArea g_fx;
+
+static bool FxBegin(int margin)
+{
+    if (!g_pCanvas) return false;
+    if (g_textInline)   CommitTextInline();
+    if (g_shapeEditing) CommitShape();
+    if (g_bezEditing)   CommitBezier();
+    if (g_isPasting)    CommitPaste();
+    LeaveSvgDisplay();    // these can swap g_pCanvas, so before it is picked
+    AnimLeaveForEdit();
+
+    g_fx = FxArea();
+    if (g_selFloating && g_selFloatBitmap) {
+        g_fx.bmp = g_selFloatBitmap;
+        g_fx.floating = true;
+        g_fx.inner = { 0, 0, (LONG)g_fx.bmp->GetWidth(), (LONG)g_fx.bmp->GetHeight() };
+    } else {
+        if (BlockIfLayerLocked()) return false;
+        g_fx.bmp = g_pCanvas;
+        int W = (int)g_pCanvas->GetWidth(), H = (int)g_pCanvas->GetHeight();
+        RECT all = { 0, 0, W, H };
+        g_fx.inner = all;
+        if (g_hasSelection && !IntersectRect(&g_fx.inner, &g_selRect, &all)) return false;
+        if (g_hasSelection && g_hasSelMask && (int)g_selMaskW == W && g_selMask.size() >= (size_t)W * H) {
+            int iw = g_fx.inner.right - g_fx.inner.left, ih = g_fx.inner.bottom - g_fx.inner.top;
+            g_fx.mask.resize((size_t)iw * ih);
+            for (int y = 0; y < ih; y++)
+                for (int x = 0; x < iw; x++)
+                    g_fx.mask[(size_t)y * iw + x] = g_selMask[(size_t)(g_fx.inner.top + y) * W + g_fx.inner.left + x];
+        }
+    }
+    int W = (int)g_fx.bmp->GetWidth(), H = (int)g_fx.bmp->GetHeight();
+    g_fx.outer = { max(0L, g_fx.inner.left - margin), max(0L, g_fx.inner.top - margin),
+                   min((LONG)W, g_fx.inner.right + margin), min((LONG)H, g_fx.inner.bottom + margin) };
+    int ow = g_fx.outer.right - g_fx.outer.left, oh = g_fx.outer.bottom - g_fx.outer.top;
+    if (ow <= 0 || oh <= 0) return false;
+
+    BitmapData bd;
+    Rect rc(g_fx.outer.left, g_fx.outer.top, ow, oh);
+    if (g_fx.bmp->LockBits(&rc, ImageLockModeRead, PixelFormat32bppARGB, &bd) != Ok) return false;
+    g_fx.before = Img::fromArgb((const uint32_t*)bd.Scan0, ow, oh, bd.Stride);
+    g_fx.bmp->UnlockBits(&bd);
+    return true;
+}
+
+// Writes result (outer's size) into the selected pixels, and the original into the rest
+static void FxShow(const Img& result)
+{
+    if (!g_fx.bmp) return;
+    int iw = g_fx.inner.right - g_fx.inner.left, ih = g_fx.inner.bottom - g_fx.inner.top;
+    int dx = g_fx.inner.left - g_fx.outer.left, dy = g_fx.inner.top - g_fx.outer.top;
+    BitmapData bd;
+    Rect rc(g_fx.inner.left, g_fx.inner.top, iw, ih);
+    if (g_fx.bmp->LockBits(&rc, ImageLockModeWrite, PixelFormat32bppARGB, &bd) != Ok) return;
+    for (int y = 0; y < ih; y++) {
+        uint32_t* row = (uint32_t*)((BYTE*)bd.Scan0 + (ptrdiff_t)y * bd.Stride);
+        for (int x = 0; x < iw; x++) {
+            bool sel = g_fx.mask.empty() || g_fx.mask[(size_t)y * iw + x];
+            const Img& src = sel ? result : g_fx.before;
+            int i = src.at(x + dx, y + dy);
+            row[x] = ((uint32_t)src.a[i] << 24) | ((uint32_t)src.r[i] << 16) | ((uint32_t)src.g[i] << 8) | src.b[i];
+        }
+    }
+    g_fx.bmp->UnlockBits(&bd);
+    InvalidateCanvas();
+}
+
+static void FxPreview(const std::function<void(Img&)>& op)
+{
+    Img work = g_fx.before;
+    op(work);
+    FxShow(work);
+}
+
+// Puts the original back, records the undo step, then applies op for good
+static void FxCommit(const std::function<void(Img&)>& op)
+{
+    HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    FxShow(g_fx.before);
+    if (!g_fx.floating) PushUndo();
+    FxPreview(op);
+    SetCursor(old);
+    g_modified = true;
+    UpdateTitleBar();
+    g_fx = FxArea();
+}
+
+static void FxCancel()
+{
+    FxShow(g_fx.before);
+    g_fx = FxArea();
+}
+
+// ── Dialogs built in code ───────────────────────────────────────────────
+// An empty dialog template; the controls are added in WM_INITDIALOG.
+static INT_PTR FxDialogBox(const wchar_t* title, short cx, short cy, DLGPROC proc, LPARAM param)
+{
+    std::vector<WORD> t;
+    auto dword = [&](DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); };
+    auto text  = [&](const wchar_t* s) { for (; *s; s++) t.push_back(*s); t.push_back(0); };
+    dword(DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
+    dword(0);                                   // extended style
+    t.push_back(0);                             // no controls in the template
+    t.push_back(0); t.push_back(0); t.push_back((WORD)cx); t.push_back((WORD)cy);
+    t.push_back(0);                             // no menu
+    t.push_back(0);                             // standard dialog class
+    text(title);
+    t.push_back(9);                             // font size, as the other dialogs
+    text(L"Segoe UI");
+    if (!g_hDarkBgBrush && g_darkMode) g_hDarkBgBrush = CreateSolidBrush(RGB(45, 45, 48));
+    return DialogBoxIndirectParamW(GetModuleHandle(NULL), (LPCDLGTEMPLATEW)t.data(), g_hwndMain, proc, param);
+}
+
+// Creates a control at a position in dialog units
+static HWND FxControl(HWND dlg, const wchar_t* cls, const wchar_t* text, DWORD style,
+                      int x, int y, int cx, int cy, int id)
+{
+    RECT r = { x, y, x + cx, y + cy };
+    MapDialogRect(dlg, &r);
+    bool edit = wcscmp(cls, L"EDIT") == 0;
+    HWND h = CreateWindowExW(edit ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                             r.left, r.top, r.right - r.left, r.bottom - r.top,
+                             dlg, (HMENU)(INT_PTR)id, GetModuleHandle(NULL), NULL);
+    SendMessage(h, WM_SETFONT, SendMessage(dlg, WM_GETFONT, 0, 0), FALSE);
+    if (g_darkMode) {
+        DWORD kind = style & BS_TYPEMASK;
+        if (wcscmp(cls, L"BUTTON") == 0 && (kind == BS_AUTOCHECKBOX || kind == BS_CHECKBOX))
+            SetWindowTheme(h, L"", L"");                  // so WM_CTLCOLORSTATIC can colour the text
+        else if (wcscmp(cls, L"BUTTON") == 0)
+            SetWindowTheme(h, L"DarkMode_Explorer", NULL);
+        else if (wcscmp(cls, WC_COMBOBOXW) == 0)
+            SetWindowTheme(h, L"DarkMode_CFD", NULL);
+    }
+    return h;
+}
+
+static INT_PTR FxDarkColors(UINT msg, WPARAM wParam)
+{
+    if ((msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN ||
+         msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORLISTBOX) && g_darkMode && g_hDarkBgBrush) {
+        SetTextColor((HDC)wParam, RGB(220, 220, 220));
+        SetBkColor((HDC)wParam, RGB(45, 45, 48));
+        return (INT_PTR)g_hDarkBgBrush;
+    }
+    return 0;
+}
+
+static void FxDarkTitle(HWND dlg)
+{
+    if (!g_darkMode) return;
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(dlg, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+}
+
+// Numbers as people type them: "0.25", "-1", "100"
+static std::wstring FxNumberText(double v)
+{
+    wchar_t buf[32];
+    StringCchPrintfW(buf, ARRAYSIZE(buf), L"%g", std::round(v * 10000) / 10000);
+    return buf;
+}
+
+static bool FxReadNumber(HWND edit, double& v)
+{
+    wchar_t buf[32] = {};
+    GetWindowTextW(edit, buf, ARRAYSIZE(buf));
+    wchar_t* end = nullptr;
+    v = wcstod(buf, &end);
+    return end != buf;
+}
+
+enum { FXC_PREVIEW = 300, FXC_RESET = 301, FXC_SLIDER = 100, FXC_VALUE = 200,
+       FXC_PRESET = 400, FXC_SIZE = 401, FXC_DIVISOR = 402, FXC_AUTODIV = 403, FXC_OFFSET = 404, FXC_ALPHA = 405,
+       FXC_CELL = 1000 };
+static const UINT FX_PREVIEW_TIMER = 1;
+static bool g_fxPreviewOn = true;   // the Preview box, remembered between dialogs
+
+// ── Slider dialogs: one row per setting ─────────────────────────────────
+struct FxSlider { const wchar_t* label; int lo, hi, def; int scale; };   // scale 100: shows 1.00 for 100
+struct FxSliderDlg {
+    const wchar_t* title;
+    std::vector<FxSlider> sliders;
+    std::vector<int>* values;                          // current values, kept between uses
+    std::function<void(Img&, const std::vector<int>&)> apply;
+    bool syncing = false;
+};
+
+static INT_PTR CALLBACK FxSliderDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* d = (FxSliderDlg*)GetWindowLongPtr(dlg, DWLP_USER);
+    const int W = 240;
+    auto showValue = [&](int i) {
+        const FxSlider& s = d->sliders[i];
+        int v = (*d->values)[i];
+        d->syncing = true;
+        SetDlgItemTextW(dlg, FXC_VALUE + i, FxNumberText(s.scale > 1 ? (double)v / s.scale : v).c_str());
+        SendDlgItemMessage(dlg, FXC_SLIDER + i, TBM_SETPOS, TRUE, v);
+        d->syncing = false;
+    };
+    auto schedule = [&]() { SetTimer(dlg, FX_PREVIEW_TIMER, 60, NULL); };
+
+    switch (msg) {
+    case WM_INITDIALOG: {
+        d = (FxSliderDlg*)lParam;
+        SetWindowLongPtr(dlg, DWLP_USER, (LONG_PTR)d);
+        FxDarkTitle(dlg);
+        int y = 7;
+        for (int i = 0; i < (int)d->sliders.size(); i++, y += 20) {
+            const FxSlider& s = d->sliders[i];
+            FxControl(dlg, L"STATIC", s.label, SS_LEFT, 7, y + 3, 62, 9, -1);
+            HWND tb = FxControl(dlg, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 70, y, 126, 16, FXC_SLIDER + i);
+            SendMessage(tb, TBM_SETRANGEMIN, FALSE, s.lo);
+            SendMessage(tb, TBM_SETRANGEMAX, FALSE, s.hi);
+            SendMessage(tb, TBM_SETPAGESIZE, 0, max(1, (s.hi - s.lo) / 20));
+            FxControl(dlg, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 200, y + 1, 33, 13, FXC_VALUE + i);
+            showValue(i);
+        }
+        y += 4;
+        FxControl(dlg, L"BUTTON", L"Preview", BS_AUTOCHECKBOX | WS_TABSTOP, 7, y + 2, 60, 10, FXC_PREVIEW);
+        CheckDlgButton(dlg, FXC_PREVIEW, g_fxPreviewOn ? BST_CHECKED : BST_UNCHECKED);
+        FxControl(dlg, L"BUTTON", L"Reset",  BS_PUSHBUTTON | WS_TABSTOP,    W - 7 - 146, y, 46, 14, FXC_RESET);
+        FxControl(dlg, L"BUTTON", L"OK",     BS_DEFPUSHBUTTON | WS_TABSTOP, W - 7 - 96,  y, 46, 14, IDOK);
+        FxControl(dlg, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP,    W - 7 - 46,  y, 46, 14, IDCANCEL);
+        schedule();
+        return TRUE;
+    }
+    case WM_HSCROLL:
+        for (int i = 0; d && i < (int)d->sliders.size(); i++)
+            if ((HWND)lParam == GetDlgItem(dlg, FXC_SLIDER + i)) {
+                (*d->values)[i] = (int)SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
+                showValue(i);
+                schedule();
+            }
+        return TRUE;
+    case WM_TIMER:
+        if (wParam == FX_PREVIEW_TIMER) {
+            KillTimer(dlg, FX_PREVIEW_TIMER);
+            HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+            if (g_fxPreviewOn) FxPreview([&](Img& img) { d->apply(img, *d->values); });
+            else               FxShow(g_fx.before);
+            SetCursor(old);
+        }
+        return TRUE;
+    case WM_COMMAND: {
+        int id = LOWORD(wParam), code = HIWORD(wParam);
+        if (id >= FXC_VALUE && id < FXC_VALUE + (int)d->sliders.size() && code == EN_CHANGE && !d->syncing) {
+            int i = id - FXC_VALUE;
+            const FxSlider& s = d->sliders[i];
+            double v;
+            if (FxReadNumber((HWND)lParam, v)) {
+                int iv = (int)std::lround(s.scale > 1 ? v * s.scale : v);
+                iv = max(s.lo, min(iv, s.hi));
+                (*d->values)[i] = iv;
+                SendDlgItemMessage(dlg, FXC_SLIDER + i, TBM_SETPOS, TRUE, iv);
+                schedule();
+            }
+            return TRUE;
+        }
+        switch (id) {
+        case FXC_PREVIEW:
+            g_fxPreviewOn = IsDlgButtonChecked(dlg, FXC_PREVIEW) == BST_CHECKED;
+            schedule();
+            return TRUE;
+        case FXC_RESET:
+            for (int i = 0; i < (int)d->sliders.size(); i++) { (*d->values)[i] = d->sliders[i].def; showValue(i); }
+            schedule();
+            return TRUE;
+        case IDOK:
+            for (int i = 0; i < (int)d->sliders.size(); i++) showValue(i);   // a half-typed value snaps back
+        case IDCANCEL:
+            KillTimer(dlg, FX_PREVIEW_TIMER);
+            EndDialog(dlg, id);
+            return TRUE;
+        }
+        break;
+    }
+    default:
+        if (INT_PTR br = FxDarkColors(msg, wParam)) return br;
+    }
+    return FALSE;
+}
+
+// Opens a slider dialog for one adjustment or filter and applies it on OK
+static void FxRunSliderDialog(const wchar_t* title, int margin, std::vector<FxSlider> sliders,
+                              std::vector<int>& remembered,
+                              std::function<void(Img&, const std::vector<int>&)> apply)
+{
+    if (remembered.size() != sliders.size()) {
+        remembered.clear();
+        for (auto& s : sliders) remembered.push_back(s.def);
+    }
+    if (!FxBegin(margin)) return;
+    FxSliderDlg d;
+    d.title = title; d.sliders = sliders; d.values = &remembered; d.apply = apply;
+    short cy = (short)(7 + 20 * sliders.size() + 4 + 14 + 7);
+    if (FxDialogBox(title, 240, cy, FxSliderDlgProc, (LPARAM)&d) == IDOK)
+        FxCommit([&](Img& img) { apply(img, remembered); });
+    else
+        FxCancel();
+}
+
+// ── The kernel dialog: preset, size, and every weight editable ─────────
+struct FxKernelPreset { const wchar_t* name; Kernel (*make)(int); };
+static const FxKernelPreset kKernelPresets[] = {
+    { L"Blur (Gaussian)",      Kernel::gaussian },
+    { L"Box Blur",             Kernel::box },
+    { L"Motion Blur",          Kernel::motion },
+    { L"Sharpen",              Kernel::sharpen },
+    { L"Edge Detect",          Kernel::edges },
+    { L"Emboss",               Kernel::emboss },
+    { L"Identity (no change)", Kernel::identity },
+    { L"Custom",               nullptr },
+};
+static const int kKernelCustom = (int)ARRAYSIZE(kKernelPresets) - 1;
+static const int kKernelMaxSize = 15;
+
+static Kernel g_fxKernel        = Kernel::gaussian(5);   // kept between uses
+static int    g_fxKernelPreset  = 0;
+static bool   g_fxKernelAutoDiv = true;
+
+struct FxKernelDlg { bool syncing = false; int shownSize = 0; };
+
+// Dialog-unit layout for an n x n grid
+static const int KD_CELL_W = 26, KD_CELL_H = 13, KD_PITCH_X = 28, KD_PITCH_Y = 15, KD_GRID_Y = 26;
+static int KernelDlgWidth(int n)   { return max(214, 14 + n * KD_PITCH_X - 2); }
+static int KernelDlgBottomY(int n) { return KD_GRID_Y + n * KD_PITCH_Y + 4; }
+static int KernelDlgHeight(int n)  { return KernelDlgBottomY(n) + 40 + 14 + 7; }
+
+static void KernelDlgFill(HWND dlg, FxKernelDlg* s)
+{
+    const Kernel& k = g_fxKernel;
+    s->syncing = true;
+    for (int i = 0; i < k.size * k.size; i++)
+        SetDlgItemTextW(dlg, FXC_CELL + i, FxNumberText(k.v[i]).c_str());
+    SetDlgItemTextW(dlg, FXC_DIVISOR, FxNumberText(k.divisor).c_str());
+    SetDlgItemTextW(dlg, FXC_OFFSET,  FxNumberText(k.offset).c_str());
+    CheckDlgButton(dlg, FXC_AUTODIV, g_fxKernelAutoDiv ? BST_CHECKED : BST_UNCHECKED);
+    EnableWindow(GetDlgItem(dlg, FXC_DIVISOR), !g_fxKernelAutoDiv);
+    SendDlgItemMessage(dlg, FXC_PRESET, CB_SETCURSEL, g_fxKernelPreset, 0);
+    CheckDlgButton(dlg, FXC_ALPHA, k.filterAlpha ? BST_CHECKED : BST_UNCHECKED);
+    SendDlgItemMessage(dlg, FXC_SIZE, CB_SETCURSEL, (k.size - 3) / 2, 0);
+    s->syncing = false;
+}
+
+// (Re)builds the grid of weights and moves the controls under it to fit
+static void KernelDlgLayout(HWND dlg, FxKernelDlg* s)
+{
+    int n = g_fxKernel.size;
+    for (int i = 0; i < s->shownSize * s->shownSize; i++)
+        if (HWND h = GetDlgItem(dlg, FXC_CELL + i)) DestroyWindow(h);
+    s->shownSize = n;
+
+    int W = KernelDlgWidth(n), gridW = n * KD_PITCH_X - 2, gx = (W - gridW) / 2;
+    HWND after = GetDlgItem(dlg, FXC_SIZE);   // tab order: the grid follows the size box
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+            HWND h = FxControl(dlg, L"EDIT", L"", ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP,
+                               gx + x * KD_PITCH_X, KD_GRID_Y + y * KD_PITCH_Y, KD_CELL_W, KD_CELL_H,
+                               FXC_CELL + y * n + x);
+            SetWindowPos(h, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            after = h;
+        }
+
+    auto place = [&](int id, int x, int y, int cx, int cy) {
+        RECT r = { x, y, x + cx, y + cy };
+        MapDialogRect(dlg, &r);
+        SetWindowPos(GetDlgItem(dlg, id), NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    };
+    int by = KernelDlgBottomY(n);
+    place(FXC_DIVISOR + 1000, 7, by + 3, 30, 9);     // labels have ids of their own so they can move
+    place(FXC_DIVISOR, 38, by, 40, 13);
+    place(FXC_AUTODIV, 82, by + 2, 34, 10);
+    place(FXC_OFFSET + 1000, 124, by + 3, 26, 9);
+    place(FXC_OFFSET, 151, by, 36, 13);
+    place(FXC_ALPHA, 7, by + 22, 160, 10);
+    int by2 = by + 40;
+    place(FXC_PREVIEW, 7, by2 + 2, 60, 10);
+    place(IDOK, W - 7 - 96, by2, 46, 14);
+    place(IDCANCEL, W - 7 - 46, by2, 46, 14);
+
+    RECT rc = { 0, 0, W, KernelDlgHeight(n) };
+    MapDialogRect(dlg, &rc);
+    AdjustWindowRectEx(&rc, GetWindowLong(dlg, GWL_STYLE), FALSE, GetWindowLong(dlg, GWL_EXSTYLE));
+    SetWindowPos(dlg, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(dlg, NULL, TRUE);
+    KernelDlgFill(dlg, s);
+}
+
+static INT_PTR CALLBACK FxKernelDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* s = (FxKernelDlg*)GetWindowLongPtr(dlg, DWLP_USER);
+    auto schedule = [&]() { SetTimer(dlg, FX_PREVIEW_TIMER, 120, NULL); };
+    auto toCustom = [&]() {
+        if (g_fxKernelPreset == kKernelCustom) return;
+        g_fxKernelPreset = kKernelCustom;
+        SendDlgItemMessage(dlg, FXC_PRESET, CB_SETCURSEL, kKernelCustom, 0);
+    };
+    auto autoDivisor = [&]() {
+        if (!g_fxKernelAutoDiv) return;
+        g_fxKernel.divisor = g_fxKernel.autoDivisor();
+        s->syncing = true;
+        SetDlgItemTextW(dlg, FXC_DIVISOR, FxNumberText(g_fxKernel.divisor).c_str());
+        s->syncing = false;
+    };
+
+    switch (msg) {
+    case WM_INITDIALOG: {
+        s = (FxKernelDlg*)lParam;
+        SetWindowLongPtr(dlg, DWLP_USER, (LONG_PTR)s);
+        FxDarkTitle(dlg);
+        FxControl(dlg, L"STATIC", L"Kernel:", SS_LEFT, 7, 9, 26, 9, -1);
+        HWND preset = FxControl(dlg, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 34, 7, 96, 120, FXC_PRESET);
+        for (auto& p : kKernelPresets) SendMessageW(preset, CB_ADDSTRING, 0, (LPARAM)p.name);
+        FxControl(dlg, L"STATIC", L"Size:", SS_LEFT, 138, 9, 20, 9, -1);
+        HWND size = FxControl(dlg, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 160, 7, 46, 120, FXC_SIZE);
+        for (int n = 3; n <= kKernelMaxSize; n += 2) {
+            wchar_t t[16]; StringCchPrintfW(t, ARRAYSIZE(t), L"%d \x00d7 %d", n, n);
+            SendMessageW(size, CB_ADDSTRING, 0, (LPARAM)t);
+        }
+        // Placed by KernelDlgLayout
+        FxControl(dlg, L"STATIC", L"Divisor:", SS_LEFT, 0, 0, 1, 1, FXC_DIVISOR + 1000);
+        FxControl(dlg, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 1, 1, FXC_DIVISOR);
+        FxControl(dlg, L"BUTTON", L"Auto", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 0, 1, 1, FXC_AUTODIV);
+        FxControl(dlg, L"STATIC", L"Offset:", SS_LEFT, 0, 0, 1, 1, FXC_OFFSET + 1000);
+        FxControl(dlg, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 1, 1, FXC_OFFSET);
+        FxControl(dlg, L"BUTTON", L"Filter alpha (transparency) too", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 0, 1, 1, FXC_ALPHA);
+        FxControl(dlg, L"BUTTON", L"Preview", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 0, 1, 1, FXC_PREVIEW);
+        CheckDlgButton(dlg, FXC_PREVIEW, g_fxPreviewOn ? BST_CHECKED : BST_UNCHECKED);
+        FxControl(dlg, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 0, 1, 1, IDOK);
+        FxControl(dlg, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 1, 1, IDCANCEL);
+        KernelDlgLayout(dlg, s);
+        schedule();
+        return TRUE;
+    }
+    case WM_TIMER:
+        if (wParam == FX_PREVIEW_TIMER) {
+            KillTimer(dlg, FX_PREVIEW_TIMER);
+            HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+            if (g_fxPreviewOn) { Kernel k = g_fxKernel; FxPreview([&](Img& img) { img.convolve(k); }); }
+            else               FxShow(g_fx.before);
+            SetCursor(old);
+        }
+        return TRUE;
+    case WM_COMMAND: {
+        int id = LOWORD(wParam), code = HIWORD(wParam);
+        Kernel& k = g_fxKernel;
+        if (id >= FXC_CELL && id < FXC_CELL + k.size * k.size) {
+            if (code == EN_CHANGE && !s->syncing) {
+                double v;
+                k.v[id - FXC_CELL] = FxReadNumber((HWND)lParam, v) ? (float)v : 0.0f;   // blank counts as 0
+                toCustom();
+                autoDivisor();
+                schedule();
+            }
+            return TRUE;
+        }
+        switch (id) {
+        case FXC_PRESET:
+            if (code == CBN_SELCHANGE) {
+                int p = (int)SendDlgItemMessage(dlg, FXC_PRESET, CB_GETCURSEL, 0, 0);
+                if (p >= 0 && p < kKernelCustom) {
+                    g_fxKernelPreset = p;
+                    k = kKernelPresets[p].make(k.size);   // with the preset's own alpha choice
+                    g_fxKernelAutoDiv = true;
+                    if (p == 5) g_fxKernelAutoDiv = false;   // emboss divides by its own amount
+                    KernelDlgFill(dlg, s);
+                    schedule();
+                } else g_fxKernelPreset = kKernelCustom;
+            }
+            return TRUE;
+        case FXC_SIZE:
+            if (code == CBN_SELCHANGE) {
+                int n = 3 + 2 * (int)SendDlgItemMessage(dlg, FXC_SIZE, CB_GETCURSEL, 0, 0);
+                if (n == k.size) return TRUE;
+                if (g_fxKernelPreset < kKernelCustom) {
+                    float offset = k.offset;
+                    bool filterAlpha = k.filterAlpha;
+                    k = kKernelPresets[g_fxKernelPreset].make(n);
+                    if (g_fxKernelPreset != 5) k.offset = offset;
+                    k.filterAlpha = filterAlpha;
+                } else {
+                    // Custom: keep the weights around the middle, cut off or padded with 0
+                    Kernel nk(n);
+                    nk.divisor = k.divisor; nk.offset = k.offset; nk.filterAlpha = k.filterAlpha;
+                    int shift = (n - k.size) / 2;
+                    for (int y = 0; y < k.size; y++)
+                        for (int x = 0; x < k.size; x++) {
+                            int nx = x + shift, ny = y + shift;
+                            if (nx >= 0 && ny >= 0 && nx < n && ny < n) nk.at(nx, ny) = k.at(x, y);
+                        }
+                    k = nk;
+                }
+                if (g_fxKernelAutoDiv) k.divisor = k.autoDivisor();
+                KernelDlgLayout(dlg, s);
+                schedule();
+            }
+            return TRUE;
+        case FXC_ALPHA:
+            k.filterAlpha = IsDlgButtonChecked(dlg, FXC_ALPHA) == BST_CHECKED;
+            schedule();
+            return TRUE;
+        case FXC_AUTODIV:
+            g_fxKernelAutoDiv = IsDlgButtonChecked(dlg, FXC_AUTODIV) == BST_CHECKED;
+            EnableWindow(GetDlgItem(dlg, FXC_DIVISOR), !g_fxKernelAutoDiv);
+            autoDivisor();
+            schedule();
+            return TRUE;
+        case FXC_DIVISOR:
+            if (code == EN_CHANGE && !s->syncing) {
+                double v;
+                if (FxReadNumber((HWND)lParam, v)) { k.divisor = (float)v; schedule(); }   // 0 too: convolve makes it tiny
+            }
+            return TRUE;
+        case FXC_OFFSET:
+            if (code == EN_CHANGE && !s->syncing) {
+                double v;
+                k.offset = FxReadNumber((HWND)lParam, v) ? (float)v : 0.0f;
+                schedule();
+            }
+            return TRUE;
+        case FXC_PREVIEW:
+            g_fxPreviewOn = IsDlgButtonChecked(dlg, FXC_PREVIEW) == BST_CHECKED;
+            schedule();
+            return TRUE;
+        case IDOK:
+        case IDCANCEL:
+            KillTimer(dlg, FX_PREVIEW_TIMER);
+            EndDialog(dlg, id);
+            return TRUE;
+        }
+        break;
+    }
+    default:
+        if (INT_PTR br = FxDarkColors(msg, wParam)) return br;
+    }
+    return FALSE;
+}
+
+// preset: index into kKernelPresets to start from, or -1 to carry on with the last kernel
+static void FxRunKernelDialog(int preset)
+{
+    if (preset >= 0 && preset < kKernelCustom) {
+        int n = g_fxKernel.size;
+        if (preset != g_fxKernelPreset) n = preset == 0 ? 5 : 3;   // a fresh start for a different filter
+        g_fxKernelPreset  = preset;
+        g_fxKernel        = kKernelPresets[preset].make(n);
+        g_fxKernelAutoDiv = preset != 5;
+    }
+    Kernel saved = g_fxKernel;
+    int savedPreset = g_fxKernelPreset;
+    bool savedAuto = g_fxKernelAutoDiv;
+    if (!FxBegin(kKernelMaxSize / 2 + 1)) return;
+    FxKernelDlg s;
+    int n = g_fxKernel.size;
+    INT_PTR r = FxDialogBox(L"Kernel Filter", (short)KernelDlgWidth(n), (short)KernelDlgHeight(n),
+                            FxKernelDlgProc, (LPARAM)&s);
+    if (r == IDOK) {
+        Kernel k = g_fxKernel;
+        FxCommit([&](Img& img) { img.convolve(k); });
+    } else {
+        FxCancel();
+        g_fxKernel = saved; g_fxKernelPreset = savedPreset; g_fxKernelAutoDiv = savedAuto;
+    }
+}
+
+// Applies an adjustment that has no settings
+static void FxRunInstant(const std::function<void(Img&)>& op)
+{
+    if (!FxBegin(0)) return;
+    FxCommit(op);
+}
+
+// The Adjust and Filters menu commands. Returns false for other commands.
+static bool DoEffectCommand(UINT id)
+{
+    static std::vector<int> vBright, vHue, vLevels, vThresh, vPoster, vNoise, vPixel;
+    switch (id) {
+    case ID_ADJ_BRIGHTNESS:
+        FxRunSliderDialog(L"Brightness / Contrast", 0,
+            { { L"Brightness:", -100, 100, 0, 1 }, { L"Contrast:", -100, 100, 0, 1 } }, vBright,
+            [](Img& img, const std::vector<int>& v) { img.brightnessContrast(v[0], v[1]); });
+        return true;
+    case ID_ADJ_HUESAT:
+        FxRunSliderDialog(L"Hue / Saturation", 0,
+            { { L"Hue:", -180, 180, 0, 1 }, { L"Saturation:", -100, 100, 0, 1 }, { L"Lightness:", -100, 100, 0, 1 } }, vHue,
+            [](Img& img, const std::vector<int>& v) { img.hueSaturation(v[0], v[1], v[2]); });
+        return true;
+    case ID_ADJ_LEVELS:
+        FxRunSliderDialog(L"Levels", 0,
+            { { L"Input black:", 0, 255, 0, 1 }, { L"Input white:", 0, 255, 255, 1 },
+              { L"Gamma:", 10, 500, 100, 100 },
+              { L"Output black:", 0, 255, 0, 1 }, { L"Output white:", 0, 255, 255, 1 } }, vLevels,
+            [](Img& img, const std::vector<int>& v) { img.levels(v[0], v[1], v[2] / 100.0f, v[3], v[4]); });
+        return true;
+    case ID_ADJ_THRESHOLD:
+        FxRunSliderDialog(L"Threshold", 0, { { L"Level:", 0, 255, 128, 1 } }, vThresh,
+            [](Img& img, const std::vector<int>& v) { img.threshold(v[0]); });
+        return true;
+    case ID_ADJ_POSTERIZE:
+        FxRunSliderDialog(L"Posterize", 0, { { L"Levels:", 2, 32, 4, 1 } }, vPoster,
+            [](Img& img, const std::vector<int>& v) { img.posterize(v[0]); });
+        return true;
+    case ID_ADJ_AUTOLEVEL: FxRunInstant([](Img& img) { img.autoLevel(); }); return true;
+    case ID_ADJ_EQUALIZE:  FxRunInstant([](Img& img) { img.equalize(); });  return true;
+    case ID_ADJ_INVERT:    FxRunInstant([](Img& img) { img.invert(); });    return true;
+    case ID_ADJ_GRAY:      FxRunInstant([](Img& img) { img.gray(); });      return true;
+    case ID_ADJ_SEPIA:     FxRunInstant([](Img& img) { img.sepia(); });     return true;
+
+    case ID_FX_BLUR:    FxRunKernelDialog(0);  return true;
+    case ID_FX_MOTION:  FxRunKernelDialog(2);  return true;
+    case ID_FX_SHARPEN: FxRunKernelDialog(3);  return true;
+    case ID_FX_EDGES:   FxRunKernelDialog(4);  return true;
+    case ID_FX_EMBOSS:  FxRunKernelDialog(5);  return true;
+    case ID_FX_KERNEL:  FxRunKernelDialog(-1); return true;
+    case ID_FX_NOISE: {
+        unsigned seed = GetTickCount() | 1;   // one grain pattern for the preview and the result
+        FxRunSliderDialog(L"Add Noise", 0, { { L"Amount:", 0, 100, 20, 1 } }, vNoise,
+            [seed](Img& img, const std::vector<int>& v) { img.addNoise(v[0], seed); });
+        return true;
+    }
+    case ID_FX_PIXELATE:
+        FxRunSliderDialog(L"Pixelate", 0, { { L"Cell size:", 2, 100, 8, 1 } }, vPixel,
+            [](Img& img, const std::vector<int>& v) { img.pixelate(v[0]); });
+        return true;
+    }
+    return false;
+}
+
+// ============================================================
 //  Text tool dialog
 // ============================================================
 
@@ -18008,6 +18693,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         InitCommonControlsEx(&icc);
 
         g_hMenuMain = LoadMenu(GetModuleHandle(NULL), MAKEINTRESOURCE(IDR_MENU_MAIN));
+        BuildEffectMenus();
         CreateToolbar(hwnd);
         CreateStatusBar(hwnd);
 
@@ -18747,6 +19433,15 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_IMAGE_FLIP_H:       DoFlipCanvas(true);    break;
         case ID_IMAGE_FLIP_V:       DoFlipCanvas(false);   break;
         case ID_IMAGE_RESIZE:       DoResizeCanvas();      break;
+
+        // ── Adjust and Filters ──────────────────────────────────
+        case ID_ADJ_BRIGHTNESS: case ID_ADJ_HUESAT: case ID_ADJ_LEVELS: case ID_ADJ_THRESHOLD:
+        case ID_ADJ_POSTERIZE:  case ID_ADJ_INVERT: case ID_ADJ_GRAY:   case ID_ADJ_SEPIA:
+        case ID_ADJ_AUTOLEVEL:  case ID_ADJ_EQUALIZE:
+        case ID_FX_BLUR:  case ID_FX_SHARPEN: case ID_FX_EDGES: case ID_FX_EMBOSS: case ID_FX_MOTION:
+        case ID_FX_KERNEL: case ID_FX_NOISE:  case ID_FX_PIXELATE:
+            DoEffectCommand(LOWORD(wParam));
+            break;
         case ID_IMAGE_CROP:         DoCropToSelection();   break;
 
         // ── View ────────────────────────────────────────────────

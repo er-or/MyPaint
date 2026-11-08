@@ -12,6 +12,19 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   Ctrl+C with nothing selected copies the whole image
 - **Image operations:** rotate, flip, resize, crop to selection (Ctrl+Shift+X),
   undo and redo
+- **Image → Adjust:** brightness/contrast, hue/saturation, levels, threshold and
+  posterize, each with sliders, a number box and a live preview on the canvas;
+  plus auto level, equalize, invert, grayscale and sepia in one click
+- **Image → Filters:** blur, motion blur, sharpen, edge detect and emboss open
+  a kernel editor: pick a preset and a size from 3 × 3 to 15 × 15, then change
+  any weight, the divisor or the offset, with a live preview ("Custom Kernel"
+  picks up where you left off). A divisor of 0 divides by a tiny number
+  instead. "Filter alpha too" filters transparency as well, as SVG's
+  feConvolveMatrix does; it starts ticked for blur and sharpen and unticked
+  for edge detect and emboss. Also add noise and pixelate.
+  Adjustments and filters change the active layer, only inside the selection
+  when there is one. The processing is in the `Img` class
+  (`ImgAdjust.cpp`, `ImgFilter.cpp`), plain readable loops.
 - **Opening files:** File → Open, drag and drop onto the window, or
   File → Open Recent (the last 10 images)
 - **Folder browser:** a thumbnail strip for flicking through the images in a
@@ -148,6 +161,8 @@ downloaded.
 |---|---|
 | `MyPaint.cpp` | The whole application |
 | `MyPaint.rc`, `resource.h` | Menus, dialogs and the icon |
+| `Img.h`, `Img.cpp`, `ImgAdjust.cpp`, `ImgFilter.cpp` | Image processing on red, green, blue and alpha planes: blend modes, adjustments, kernels and filters |
+| `Zip.h`, `Zip.cpp`, `Heif.h`, `Heif.cpp` | Reading and writing .ora zips; reading Windows Paint .paint files |
 | `app.manifest` | DPI awareness and visual styles |
 | `nanosvg.h`, `nanosvgrast.h` | SVG parser and rasteriser |
 | `third_party/libwebp-1.4.0-windows-x64/` | WebP headers and libraries |
