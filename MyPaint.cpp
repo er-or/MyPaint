@@ -69,6 +69,7 @@ using std::max;
 using std::min;
 
 #include "resource.h"
+#include "Img.h"
 
 // ============================================================
 //  Constants
@@ -355,6 +356,7 @@ struct Layer {
     Bitmap* bmp = nullptr;
     bool    visible = true;
     int     opacity = 100;   // percent
+    BlendMode blend = BlendMode::Normal;   // how it mixes with what is beneath (Img.h)
     bool    locked = false;  // the tools and editing commands leave it alone
     // Names these pixels for the cached combinations of layers (see FlatChunk).
     // Made new whenever they may have changed: when the layer stops being the
@@ -1196,19 +1198,61 @@ static void FlatPrepare(Graphics& g)
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
 }
 
-static void FlatDrawLayer(Graphics& g, int i, int w, int h)
+// Draws src over dst the ordinary way, at an opacity in percent
+static void FlatDrawNormal(Bitmap* dst, Bitmap* src, int opacity, int w, int h)
+{
+    Graphics g(dst);
+    FlatPrepare(g);
+    Rect dest(0, 0, w, h);
+    if (opacity >= 100) {
+        g.DrawImage(src, dest, 0, 0, w, h, UnitPixel);
+    } else {
+        ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,opacity / 100.0f,0, 0,0,0,0,1 };
+        ImageAttributes ia;
+        ia.SetColorMatrix(&cm);
+        g.DrawImage(src, dest, 0, 0, w, h, UnitPixel, &ia);
+    }
+}
+
+// Draws src over dst with a blend mode, at an opacity in percent. GDI+ has no
+// blend modes, so the pixels go through Img (Img.h). Both are the same size.
+static void BlendBitmapOnto(Bitmap* dst, Bitmap* src, BlendMode mode, int opacity)
+{
+    int w = (int)dst->GetWidth(), h = (int)dst->GetHeight();
+    Rect r(0, 0, w, h);
+    BitmapData sd, dd;
+    if (src->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &sd) != Ok) return;
+    if (dst->LockBits(&r, ImageLockModeRead | ImageLockModeWrite, PixelFormat32bppARGB, &dd) != Ok) {
+        src->UnlockBits(&sd);
+        return;
+    }
+    Img top  = Img::fromArgb((const uint32_t*)sd.Scan0, w, h, sd.Stride);
+    Img back = Img::fromArgb((const uint32_t*)dd.Scan0, w, h, dd.Stride);
+    back.blend(top, mode, opacity / 100.f);
+    back.toArgb((uint32_t*)dd.Scan0, dd.Stride);
+    dst->UnlockBits(&dd);
+    src->UnlockBits(&sd);
+}
+
+// A layer that can be drawn without looking at what is beneath it
+static bool FlatIsPlain(const Layer& l) { return l.blend == BlendMode::Normal || !l.visible || l.opacity <= 0; }
+
+static void FlatDrawLayer(Bitmap* dst, int i, int w, int h)
 {
     const Layer& l = g_layers[i];
     if (!l.visible || l.opacity <= 0) return;
-    Rect dest(0, 0, w, h);
-    if (l.opacity >= 100) {
-        g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel);
-    } else {
-        ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,l.opacity / 100.0f,0, 0,0,0,0,1 };
-        ImageAttributes ia;
-        ia.SetColorMatrix(&cm);
-        g.DrawImage(LayerBitmap(i), dest, 0, 0, w, h, UnitPixel, &ia);
-    }
+    if (l.blend == BlendMode::Normal) FlatDrawNormal(dst, LayerBitmap(i), l.opacity, w, h);
+    else BlendBitmapOnto(dst, LayerBitmap(i), l.blend, l.opacity);
+}
+
+// A new transparent w x h bitmap for combining into, or null when out of memory
+static Bitmap* FlatNewBitmap(int w, int h)
+{
+    Bitmap* b = new Bitmap(w, h, PixelFormat32bppPARGB);
+    if (b->GetLastStatus() != Ok) { delete b; return nullptr; }
+    Graphics g(b);
+    g.Clear(Color(0, 0, 0, 0));
+    return b;
 }
 
 // Layers [from, to) combined, or null when none of them shows. ok is false when out of memory.
@@ -1217,12 +1261,9 @@ static Bitmap* FlatCombine(int from, int to, int w, int h, bool& ok)
     bool any = false;
     for (int i = from; i < to; i++) any |= g_layers[i].visible && g_layers[i].opacity > 0;
     if (!any) return nullptr;
-    Bitmap* b = new Bitmap(w, h, PixelFormat32bppPARGB);
-    if (b->GetLastStatus() != Ok) { delete b; ok = false; return nullptr; }
-    Graphics g(b);
-    g.Clear(Color(0, 0, 0, 0));
-    FlatPrepare(g);
-    for (int i = from; i < to; i++) FlatDrawLayer(g, i, w, h);
+    Bitmap* b = FlatNewBitmap(w, h);
+    if (!b) { ok = false; return nullptr; }
+    for (int i = from; i < to; i++) FlatDrawLayer(b, i, w, h);
     return b;
 }
 
@@ -1245,30 +1286,52 @@ static void FlatFreeChunks()
     g_flatChunks.clear();
 }
 
-static unsigned FlatLayerShow(const Layer& l) { return (unsigned)l.opacity * 2 + (l.visible ? 1 : 0); }
-
-// Draws layers [s, e), none of them active, from their cached chunk image
-static bool FlatDrawChunk(Graphics& g, int s, int e, int w, int h)
+static unsigned FlatLayerShow(const Layer& l)
 {
-    if (e - s == 1) { FlatDrawLayer(g, s, w, h); return true; }   // nothing to save by caching
+    return ((unsigned)l.blend << 8) | ((unsigned)l.opacity * 2 + (l.visible ? 1 : 0));
+}
+
+// A chunk of layers [s, e) can be kept combined when every layer in it is plain:
+// one with a blend mode has to be mixed with the real picture beneath it
+static bool FlatChunkCacheable(int s, int e)
+{
+    if (e - s < 2) return false;   // nothing to save by caching one layer
+    for (int i = s; i < e; i++) if (!FlatIsPlain(g_layers[i])) return false;
+    return true;
+}
+
+// The cached image of a cacheable chunk, made if it isn't there yet. Null when
+// nothing in it shows; ok is false when out of memory.
+static Bitmap* FlatChunkImage(int s, int e, int w, int h, bool& ok)
+{
     std::vector<unsigned> key = { (unsigned)w, (unsigned)h };
     for (int i = s; i < e; i++) { key.push_back(g_layers[i].uid); key.push_back(FlatLayerShow(g_layers[i])); }
-    Bitmap* bmp = nullptr;
-    bool found = false;
     for (auto& c : g_flatChunks)
-        if (c.key == key) { c.used = true; bmp = c.bmp; found = true; break; }
-    if (!found) {
-        bool ok = true;
-        bmp = FlatCombine(s, e, w, h, ok);
-        if (!ok) return false;
-        FlatChunk c;
-        c.key = std::move(key);
-        c.bmp = bmp;
-        c.used = true;
-        g_flatChunks.push_back(std::move(c));
+        if (c.key == key) { c.used = true; return c.bmp; }
+    Bitmap* bmp = FlatCombine(s, e, w, h, ok);
+    if (!ok) return nullptr;
+    FlatChunk c;
+    c.key = std::move(key);
+    c.bmp = bmp;
+    c.used = true;
+    g_flatChunks.push_back(std::move(c));
+    return bmp;
+}
+
+// Draws layers [from, to) onto dst in order, whole chunks from their cached images
+static void FlatDrawRange(Bitmap* dst, int from, int to, const std::vector<std::pair<int, int>>& chunks, int w, int h, bool& ok)
+{
+    for (auto [s, e] : chunks) {
+        int cs = max(s, from), ce = min(e, to);
+        if (cs >= ce) continue;
+        if (cs == s && ce == e && FlatChunkCacheable(s, e)) {
+            Bitmap* bmp = FlatChunkImage(s, e, w, h, ok);
+            if (!ok) return;
+            if (bmp) FlatDrawNormal(dst, bmp, 100, w, h);
+        } else {
+            for (int i = cs; i < ce; i++) FlatDrawLayer(dst, i, w, h);
+        }
     }
-    if (bmp) g.DrawImage(bmp, Rect(0, 0, w, h), 0, 0, w, h, UnitPixel);
-    return true;
 }
 
 // Layers [from, to) combined through the chunks; chunks holds where each chunk starts and ends
@@ -1277,22 +1340,18 @@ static Bitmap* FlatCombineChunked(int from, int to, const std::vector<std::pair<
     bool any = false;
     for (int i = from; i < to; i++) any |= g_layers[i].visible && g_layers[i].opacity > 0;
     if (!any) return nullptr;
-    Bitmap* b = new Bitmap(w, h, PixelFormat32bppPARGB);
-    if (b->GetLastStatus() != Ok) { delete b; ok = false; return nullptr; }
-    Graphics g(b);
-    g.Clear(Color(0, 0, 0, 0));
-    FlatPrepare(g);
-    for (auto [s, e] : chunks) {
-        int cs = max(s, from), ce = min(e, to);
-        if (cs >= ce) continue;
-        if (cs == s && ce == e) {
-            if (!FlatDrawChunk(g, s, e, w, h)) { delete b; ok = false; return nullptr; }
-        } else {
-            for (int i = cs; i < ce; i++) FlatDrawLayer(g, i, w, h);   // the part of the active layer's chunk
-        }
-    }
+    Bitmap* b = FlatNewBitmap(w, h);
+    if (!b) { ok = false; return nullptr; }
+    FlatDrawRange(b, from, to, chunks, w, h, ok);
+    if (!ok) { delete b; return nullptr; }
     return b;
 }
+
+// When a layer above the active one has a blend mode, the layers above can't be
+// combined ahead of time (they mix with what is drawn beneath), so they are drawn
+// onto the picture each time, still using the cached chunks where they can
+static bool g_flatAboveLive = false;
+static std::vector<std::pair<int, int>> g_flatChunkBounds;
 
 // Brings g_flatBelow and g_flatAbove up to date; false if there isn't the memory for them
 static bool FlatUpdateParts(int w, int h)
@@ -1313,7 +1372,15 @@ static bool FlatUpdateParts(int w, int h)
     for (auto& c : g_flatChunks) c.used = false;
     bool ok = true;
     g_flatBelow = FlatCombineChunked(0, a, chunks, w, h, ok);
-    if (ok) g_flatAbove = FlatCombineChunked(a + 1, n, chunks, w, h, ok);
+    g_flatAboveLive = false;
+    for (int i = a + 1; i < n; i++) if (!FlatIsPlain(g_layers[i])) g_flatAboveLive = true;
+    if (ok && !g_flatAboveLive) g_flatAbove = FlatCombineChunked(a + 1, n, chunks, w, h, ok);
+    if (ok && g_flatAboveLive) {
+        // Make sure the chunks the live drawing will use are there, and kept
+        for (auto [s, e] : chunks)
+            if (s > a && FlatChunkCacheable(s, e)) { FlatChunkImage(s, e, w, h, ok); if (!ok) break; }
+    }
+    g_flatChunkBounds = chunks;
     // Chunks no longer in the picture go
     for (size_t i = 0; i < g_flatChunks.size();) {
         if (g_flatChunks[i].used) { i++; continue; }
@@ -1348,19 +1415,21 @@ static Bitmap* FlattenedCanvas(bool exact)
         return g_pCanvas;
     }
     g_flatVersion = g_canvasVersion;
-    Graphics g(g_flatBitmap);
-    FlatPrepare(g);
     int n = (int)g_layers.size();
     g_flatIsExact = exact || n <= 2;
     if (!g_flatIsExact && FlatUpdateParts(w, h)) {
         // Only the active layer changes while drawing, so the rest comes ready made
-        Rect dest(0, 0, w, h);
-        if (g_flatBelow) g.DrawImage(g_flatBelow, dest, 0, 0, w, h, UnitPixel);
-        FlatDrawLayer(g, g_activeLayer, w, h);
-        if (g_flatAbove) g.DrawImage(g_flatAbove, dest, 0, 0, w, h, UnitPixel);
+        if (g_flatBelow) FlatDrawNormal(g_flatBitmap, g_flatBelow, 100, w, h);
+        FlatDrawLayer(g_flatBitmap, g_activeLayer, w, h);
+        if (g_flatAboveLive) {
+            bool ok = true;
+            FlatDrawRange(g_flatBitmap, g_activeLayer + 1, n, g_flatChunkBounds, w, h, ok);
+        } else if (g_flatAbove) {
+            FlatDrawNormal(g_flatBitmap, g_flatAbove, 100, w, h);
+        }
     } else {
         if (n <= 2) FlatFreeParts();
-        for (int i = 0; i < n; i++) FlatDrawLayer(g, i, w, h);
+        for (int i = 0; i < n; i++) FlatDrawLayer(g_flatBitmap, i, w, h);
         g_flatIsExact = true;
     }
     return g_flatBitmap;
@@ -14189,6 +14258,7 @@ static void LayerDuplicate()
     InsertLayerAboveActive(b, src.name + L" copy");
     g_layers[g_activeLayer].visible = src.visible;
     g_layers[g_activeLayer].opacity = src.opacity;
+    g_layers[g_activeLayer].blend = src.blend;
     AfterLayerChange();
 }
 
@@ -14260,14 +14330,11 @@ static void LayerMergeDown()
     g_undoStack.back()->layer = g_activeLayer - 1;
     g_undoStack.back()->bmp = belowBefore;
     int w = (int)g_pCanvas->GetWidth(), h = (int)g_pCanvas->GetHeight();
-    if (g_layers[g_activeLayer].visible) {
-        Graphics g(below.bmp);
-        ColorMatrix cm = { 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,g_layers[g_activeLayer].opacity / 100.0f,0, 0,0,0,0,1 };
-        ImageAttributes ia;
-        ia.SetColorMatrix(&cm);
-        g.SetInterpolationMode(InterpolationModeNearestNeighbor);
-        g.SetPixelOffsetMode(PixelOffsetModeHalf);
-        g.DrawImage(g_pCanvas, Rect(0, 0, w, h), 0, 0, w, h, UnitPixel, &ia);
+    // At its opacity and with its blend mode, mixed with the layer below alone
+    const Layer& top = g_layers[g_activeLayer];
+    if (top.visible) {
+        if (top.blend == BlendMode::Normal) FlatDrawNormal(below.bmp, g_pCanvas, top.opacity, w, h);
+        else BlendBitmapOnto(below.bmp, g_pCanvas, top.blend, top.opacity);
     }
     delete g_pGfxCanvas; g_pGfxCanvas = nullptr;
     g_layers.erase(g_layers.begin() + g_activeLayer);
@@ -14323,6 +14390,13 @@ static void LayerSetOpacity(int i, int percent)
 {
     if (i < 0 || i >= (int)g_layers.size()) return;
     g_layers[i].opacity = max(0, min(100, percent));
+    AfterLayerChange();
+}
+
+static void LayerSetBlend(int i, BlendMode mode)
+{
+    if (i < 0 || i >= (int)g_layers.size() || g_layers[i].blend == mode) return;
+    g_layers[i].blend = mode;
     AfterLayerChange();
 }
 
@@ -14667,15 +14741,20 @@ static void LpPaint(HWND hwnd, HDC hdc)
             RECT nr = LpNameRect(top, w);
             SolidBrush& nameBr = g_layers[i].visible ? fg : fgFaint;
             g.DrawString(g_layers[i].name.c_str(), -1, &font, RectF((REAL)nr.left, (REAL)nr.top, (REAL)(nr.right - nr.left), (REAL)(nr.bottom - nr.top)), &sf, &nameBr);
-            if (g_layers[i].opacity < 100) {
-                std::wstring pct = std::to_wstring(g_layers[i].opacity) + L"%";
-                g.DrawString(pct.c_str(), -1, &fontSmall, RectF((REAL)LP_TEXT_X, (REAL)top + 2, 50.f, (REAL)LP_ROWBTN), &sf, &fgFaint);
+            if (g_layers[i].opacity < 100 || g_layers[i].blend != BlendMode::Normal) {
+                // "50%", "Multiply", or "Multiply 50%", up to the row's buttons
+                std::wstring note;
+                if (g_layers[i].blend != BlendMode::Normal) note = Img::blendName(g_layers[i].blend);
+                if (g_layers[i].opacity < 100) note += (note.empty() ? L"" : L" ") + std::to_wstring(g_layers[i].opacity) + L"%";
+                RECT lb = LpRowBtnRect(top, w, LRB_COUNT - 1);   // the leftmost button
+                g.DrawString(note.c_str(), -1, &fontSmall, RectF((REAL)LP_TEXT_X, (REAL)top + 2, (REAL)max(20, (int)lb.left - LP_TEXT_X - 2), (REAL)LP_ROWBTN), &sf, &fgFaint);
             }
             // Buttons at the row's top right
             for (int b = 0; b < LRB_COUNT; b++) {
                 // Only on hover, but a button stays while its setting isn't the default
                 bool keep = (b == LRB_EYE && !g_layers[i].visible) || (b == LRB_LOCK && g_layers[i].locked) ||
-                            (b == LRB_OPACITY && (g_layers[i].opacity < 100 || (g_hwndLpOpacityPop && g_lpOpacityPopLayer == i)));
+                            (b == LRB_OPACITY && (g_layers[i].opacity < 100 || g_layers[i].blend != BlendMode::Normal ||
+                                                  (g_hwndLpOpacityPop && g_lpOpacityPopLayer == i)));
                 if (g_lpHotRow != i && !keep) continue;
                 LpDrawRowButton(g, b, LpRowBtnRect(top, w, b), g_layers[i], ink);
             }
@@ -14823,6 +14902,29 @@ static void LpCloseOpacityPop()
 
 static RECT LpPopSliderRect(int w) { return { 12, 8, w - 50, 26 }; }
 
+// Under the slider, the blend modes in two columns as Inkscape lists them:
+// Normal to Hard Light down the left, Difference to Luminosity down the right
+static const int LP_POP_W = 220, LP_POP_MODES_Y = 60, LP_POP_MODE_H = 20, LP_POP_LEFT_COUNT = 10;
+static const int LP_POP_H = LP_POP_MODES_Y + LP_POP_LEFT_COUNT * LP_POP_MODE_H + 6;
+static int g_lpPopHotMode = -1;
+
+static RECT LpPopModeRect(int m, int w)
+{
+    int col = m < LP_POP_LEFT_COUNT ? 0 : 1, row = col ? m - LP_POP_LEFT_COUNT : m;
+    int colW = (w - 16) / 2;
+    int x = 8 + col * colW, y = LP_POP_MODES_Y + row * LP_POP_MODE_H;
+    return { x, y, x + colW - 2, y + LP_POP_MODE_H };
+}
+
+static int LpPopModeAt(POINT pt, int w)
+{
+    for (int m = 0; m < (int)BlendMode::Count; m++) {
+        RECT r = LpPopModeRect(m, w);
+        if (PtInRect(&r, pt)) return m;
+    }
+    return -1;
+}
+
 static void LpPopSetFromX(HWND hwnd, int x)
 {
     RECT rc; GetClientRect(hwnd, &rc);
@@ -14861,7 +14963,29 @@ static LRESULT CALLBACK LpOpacityPopWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
             sf.SetLineAlignment(StringAlignmentCenter);
             SolidBrush fg(g_darkMode ? Color(255, 220, 220, 220) : Color(255, 45, 45, 45));
             std::wstring pct = std::to_wstring(op) + L"%";
-            g.DrawString(pct.c_str(), -1, &font, RectF((REAL)sr.right + 8.f, 0.f, 42.f, (REAL)rc.bottom), &sf, &fg);
+            g.DrawString(pct.c_str(), -1, &font, RectF((REAL)sr.right + 8.f, 0.f, 42.f, 34.f), &sf, &fg);
+
+            // Blend modes
+            Pen sepPen(g_darkMode ? Color(255, 70, 70, 70) : Color(255, 210, 210, 210), 1.f);
+            g.DrawLine(&sepPen, 8, 34, rc.right - 8, 34);
+            SolidBrush faint(g_darkMode ? Color(255, 150, 150, 150) : Color(255, 110, 110, 110));
+            g.DrawString(L"Blend mode", -1, &font, RectF(12.f, 36.f, (REAL)rc.right - 24.f, (REAL)(LP_POP_MODES_Y - 36)), &sf, &faint);
+            BlendMode cur = g_lpOpacityPopLayer >= 0 && g_lpOpacityPopLayer < (int)g_layers.size()
+                ? g_layers[g_lpOpacityPopLayer].blend : BlendMode::Normal;
+            SolidBrush white(Color(255, 255, 255, 255));
+            for (int m = 0; m < (int)BlendMode::Count; m++) {
+                RECT r = LpPopModeRect(m, rc.right);
+                RectF rf((REAL)r.left, (REAL)r.top, (REAL)(r.right - r.left), (REAL)(r.bottom - r.top));
+                SolidBrush* text = &fg;
+                if (m == (int)cur) {
+                    g.FillRectangle(&acc, rf);
+                    text = &white;
+                } else if (m == g_lpPopHotMode) {
+                    text = &acc;
+                }
+                RectF tf(rf.X + 6.f, rf.Y, rf.Width - 6.f, rf.Height);
+                g.DrawString(Img::blendName((BlendMode)m), -1, &font, tf, &sf, text);
+            }
         }
         Graphics screen(hdc);
         screen.DrawImage(&back, 0, 0, rc.right, rc.bottom);
@@ -14872,16 +14996,30 @@ static LRESULT CALLBACK LpOpacityPopWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         RECT rc; GetClientRect(hwnd, &rc);
         if (!PtInRect(&rc, pt)) { LpCloseOpacityPop(); return 0; }
-        g_lpOpacityPopDrag = true;
-        LpPopSetFromX(hwnd, pt.x);
+        if (pt.y < 34) {   // the slider
+            g_lpOpacityPopDrag = true;
+            LpPopSetFromX(hwnd, pt.x);
+            return 0;
+        }
+        int m = LpPopModeAt(pt, rc.right);
+        if (m >= 0) {
+            LayerSetBlend(g_lpOpacityPopLayer, (BlendMode)m);
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (g_hwndLayersPanel) InvalidateRect(g_hwndLayersPanel, NULL, FALSE);
+        }
         return 0;
     }
     case WM_RBUTTONDOWN:
         LpCloseOpacityPop();
         return 0;
-    case WM_MOUSEMOVE:
-        if (g_lpOpacityPopDrag) LpPopSetFromX(hwnd, GET_X_LPARAM(lParam));
+    case WM_MOUSEMOVE: {
+        if (g_lpOpacityPopDrag) { LpPopSetFromX(hwnd, GET_X_LPARAM(lParam)); return 0; }
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        int hot = PtInRect(&rc, pt) ? LpPopModeAt(pt, rc.right) : -1;
+        if (hot != g_lpPopHotMode) { g_lpPopHotMode = hot; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
+    }
     case WM_LBUTTONUP:
         g_lpOpacityPopDrag = false;
         return 0;
@@ -14905,9 +15043,17 @@ static void LpOpenOpacityPop(HWND panel, int layer, const RECT& button)
         registered = RegisterClassEx(&wc) != 0;
     }
     LpCloseOpacityPop();
-    const int popW = 170, popH = 34;
+    const int popW = LP_POP_W, popH = LP_POP_H;
+    g_lpPopHotMode = -1;
     POINT pt = { button.right - popW, button.bottom + 2 };
     ClientToScreen(panel, &pt);
+    // Above the button instead when there isn't room below it on the screen
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfo(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi) && pt.y + popH > mi.rcWork.bottom) {
+        POINT top = { 0, button.top - 2 };
+        ClientToScreen(panel, &top);
+        pt.y = max((int)mi.rcWork.top, (int)top.y - popH);
+    }
     g_lpOpacityPopLayer = layer;
     g_hwndLpOpacityPop = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"MyPaintLayerOpacityPop", NULL, WS_POPUP | WS_BORDER,
         pt.x, pt.y, popW, popH, g_hwndMain, NULL, GetModuleHandle(NULL), NULL);

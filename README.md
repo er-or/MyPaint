@@ -26,8 +26,12 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   and move layers, and right-clicking a row adds duplicate, rename, merge down,
   and hiding or locking other layers or all of them. Drag the panel's left edge
   to resize it. Drag a row to reorder it; double-click its name
-  to rename it. Saving flattens for now, since PNG, JPEG and the others hold one
-  picture, and MyPaint says so the first time.
+  to rename it. The opacity button also sets the layer's blend mode (Multiply,
+  Screen, Overlay, Difference, Color and the rest of the 16 that SVG, CSS and
+  Inkscape use). The blending lives in its own `Img` class (`Img.h`,
+  `Img.cpp`), plain loops over red, green, blue and alpha planes, meant to be
+  read and edited by hand. Saving flattens for now, since PNG, JPEG and the
+  others hold one picture, and MyPaint says so the first time.
 - **Animated GIF and WebP:** play by themselves, with a bar above the folder
   browser: play/pause (Space), step a frame (`,` and `.`), and a track to drag.
   MyPaint can't save animations yet: editing or saving works on the frame
