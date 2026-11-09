@@ -8452,7 +8452,8 @@ static bool FxReadNumber(HWND edit, double& v)
 
 enum { FXC_PREVIEW = 300, FXC_RESET = 301, FXC_SLIDER = 100, FXC_VALUE = 200,
        FXC_PRESET = 400, FXC_SIZE = 401, FXC_DIVISOR = 402, FXC_AUTODIV = 403, FXC_OFFSET = 404, FXC_ALPHA = 405,
-       FXC_CELL = 1000 };
+       FXC_HELP = 406, FXC_CELL = 1000 };
+static const int FX_HELP_H = 27;   // the explanation at the top of each dialog: three lines, in dialog units
 static const UINT FX_PREVIEW_TIMER = 1;
 static bool g_fxPreviewOn = true;   // the Preview box, remembered between dialogs
 
@@ -8460,6 +8461,7 @@ static bool g_fxPreviewOn = true;   // the Preview box, remembered between dialo
 struct FxSlider { const wchar_t* label; int lo, hi, def; int scale; };   // scale 100: shows 1.00 for 100
 struct FxSliderDlg {
     const wchar_t* title;
+    const wchar_t* help;                               // a sentence or two on what it does
     std::vector<FxSlider> sliders;
     std::vector<int>* values;                          // current values, kept between uses
     std::function<void(Img&, const std::vector<int>&)> apply;
@@ -8485,13 +8487,14 @@ static INT_PTR CALLBACK FxSliderDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         d = (FxSliderDlg*)lParam;
         SetWindowLongPtr(dlg, DWLP_USER, (LONG_PTR)d);
         FxDarkTitle(dlg);
-        int y = 7;
+        FxControl(dlg, L"STATIC", d->help, SS_LEFT, 7, 7, W - 14, FX_HELP_H, FXC_HELP);
+        int y = 7 + FX_HELP_H + 5;
         for (int i = 0; i < (int)d->sliders.size(); i++, y += 20) {
             const FxSlider& s = d->sliders[i];
             FxControl(dlg, L"STATIC", s.label, SS_LEFT, 7, y + 3, 62, 9, -1);
             HWND tb = FxControl(dlg, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 70, y, 126, 16, FXC_SLIDER + i);
             SendMessage(tb, TBM_SETRANGEMIN, FALSE, s.lo);
-            SendMessage(tb, TBM_SETRANGEMAX, FALSE, s.hi);
+            SendMessage(tb, TBM_SETRANGEMAX, TRUE, s.hi);   // redraw: a position of 0 alone wouldn't move the thumb
             SendMessage(tb, TBM_SETPAGESIZE, 0, max(1, (s.hi - s.lo) / 20));
             FxControl(dlg, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 200, y + 1, 33, 13, FXC_VALUE + i);
             showValue(i);
@@ -8562,7 +8565,7 @@ static INT_PTR CALLBACK FxSliderDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
 }
 
 // Opens a slider dialog for one adjustment or filter and applies it on OK
-static void FxRunSliderDialog(const wchar_t* title, int margin, std::vector<FxSlider> sliders,
+static void FxRunSliderDialog(const wchar_t* title, const wchar_t* help, int margin, std::vector<FxSlider> sliders,
                               std::vector<int>& remembered,
                               std::function<void(Img&, const std::vector<int>&)> apply)
 {
@@ -8572,8 +8575,8 @@ static void FxRunSliderDialog(const wchar_t* title, int margin, std::vector<FxSl
     }
     if (!FxBegin(margin)) return;
     FxSliderDlg d;
-    d.title = title; d.sliders = sliders; d.values = &remembered; d.apply = apply;
-    short cy = (short)(7 + 20 * sliders.size() + 4 + 14 + 7);
+    d.title = title; d.help = help; d.sliders = sliders; d.values = &remembered; d.apply = apply;
+    short cy = (short)(7 + FX_HELP_H + 5 + 20 * sliders.size() + 4 + 14 + 7);
     if (FxDialogBox(title, 240, cy, FxSliderDlgProc, (LPARAM)&d) == IDOK)
         FxCommit([&](Img& img) { apply(img, remembered); });
     else
@@ -8581,16 +8584,31 @@ static void FxRunSliderDialog(const wchar_t* title, int margin, std::vector<FxSl
 }
 
 // ── The kernel dialog: preset, size, and every weight editable ─────────
-struct FxKernelPreset { const wchar_t* name; Kernel (*make)(int); };
+struct FxKernelPreset { const wchar_t* name; Kernel (*make)(int); const wchar_t* help; };
 static const FxKernelPreset kKernelPresets[] = {
-    { L"Blur (Gaussian)",      Kernel::gaussian },
-    { L"Box Blur",             Kernel::box },
-    { L"Motion Blur",          Kernel::motion },
-    { L"Sharpen",              Kernel::sharpen },
-    { L"Edge Detect",          Kernel::edges },
-    { L"Emboss",               Kernel::emboss },
-    { L"Identity (no change)", Kernel::identity },
-    { L"Custom",               nullptr },
+    { L"Blur (Gaussian)",      Kernel::gaussian,
+      L"Softens the picture: each pixel becomes an average of the pixels around it, the nearest "
+      L"counting most. A bigger size blurs more." },
+    { L"Box Blur",             Kernel::box,
+      L"Softens the picture: each pixel becomes the plain average of the square around it. "
+      L"A bigger size blurs more." },
+    { L"Motion Blur",          Kernel::motion,
+      L"Smears the picture sideways, like a photo of something moving fast. A bigger size "
+      L"smears further." },
+    { L"Sharpen",              Kernel::sharpen,
+      L"Makes detail crisper by pushing each pixel away from the average around it. Too much "
+      L"brings out grain and halos." },
+    { L"Edge Detect",          Kernel::edges,
+      L"Flat areas turn black and only the changes show, as bright outlines. Useful for "
+      L"finding the shapes in a picture." },
+    { L"Emboss",               Kernel::emboss,
+      L"Makes the picture look pressed into metal or paper, lit from the top left. Flat areas "
+      L"turn middle gray." },
+    { L"Identity (no change)", Kernel::identity,
+      L"Changes nothing: 1 in the middle and 0 elsewhere. A starting point for your own kernel." },
+    { L"Custom",               nullptr,
+      L"Each new pixel is the pixels under the grid times their weights, added up, divided by "
+      L"the divisor, plus the offset." },
 };
 static const int kKernelCustom = (int)ARRAYSIZE(kKernelPresets) - 1;
 static const int kKernelMaxSize = 15;
@@ -8602,7 +8620,8 @@ static bool   g_fxKernelAutoDiv = true;
 struct FxKernelDlg { bool syncing = false; int shownSize = 0; };
 
 // Dialog-unit layout for an n x n grid
-static const int KD_CELL_W = 26, KD_CELL_H = 13, KD_PITCH_X = 28, KD_PITCH_Y = 15, KD_GRID_Y = 26;
+static const int KD_CELL_W = 26, KD_CELL_H = 13, KD_PITCH_X = 28, KD_PITCH_Y = 15;
+static const int KD_HELP_Y = 26, KD_GRID_Y = KD_HELP_Y + FX_HELP_H + 4;   // the explanation sits above the grid
 static int KernelDlgWidth(int n)   { return max(214, 14 + n * KD_PITCH_X - 2); }
 static int KernelDlgBottomY(int n) { return KD_GRID_Y + n * KD_PITCH_Y + 4; }
 static int KernelDlgHeight(int n)  { return KernelDlgBottomY(n) + 40 + 14 + 7; }
@@ -8618,6 +8637,7 @@ static void KernelDlgFill(HWND dlg, FxKernelDlg* s)
     CheckDlgButton(dlg, FXC_AUTODIV, g_fxKernelAutoDiv ? BST_CHECKED : BST_UNCHECKED);
     EnableWindow(GetDlgItem(dlg, FXC_DIVISOR), !g_fxKernelAutoDiv);
     SendDlgItemMessage(dlg, FXC_PRESET, CB_SETCURSEL, g_fxKernelPreset, 0);
+    SetDlgItemTextW(dlg, FXC_HELP, kKernelPresets[g_fxKernelPreset].help);
     CheckDlgButton(dlg, FXC_ALPHA, k.filterAlpha ? BST_CHECKED : BST_UNCHECKED);
     SendDlgItemMessage(dlg, FXC_SIZE, CB_SETCURSEL, (k.size - 3) / 2, 0);
     s->syncing = false;
@@ -8649,6 +8669,7 @@ static void KernelDlgLayout(HWND dlg, FxKernelDlg* s)
                      SWP_NOZORDER | SWP_NOACTIVATE);
     };
     int by = KernelDlgBottomY(n);
+    place(FXC_HELP, 7, KD_HELP_Y, W - 14, FX_HELP_H);
     place(FXC_DIVISOR + 1000, 7, by + 3, 30, 9);     // labels have ids of their own so they can move
     place(FXC_DIVISOR, 38, by, 40, 13);
     place(FXC_AUTODIV, 82, by + 2, 34, 10);
@@ -8676,6 +8697,7 @@ static INT_PTR CALLBACK FxKernelDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         if (g_fxKernelPreset == kKernelCustom) return;
         g_fxKernelPreset = kKernelCustom;
         SendDlgItemMessage(dlg, FXC_PRESET, CB_SETCURSEL, kKernelCustom, 0);
+        SetDlgItemTextW(dlg, FXC_HELP, kKernelPresets[kKernelCustom].help);
     };
     auto autoDivisor = [&]() {
         if (!g_fxKernelAutoDiv) return;
@@ -8700,6 +8722,7 @@ static INT_PTR CALLBACK FxKernelDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             SendMessageW(size, CB_ADDSTRING, 0, (LPARAM)t);
         }
         // Placed by KernelDlgLayout
+        FxControl(dlg, L"STATIC", L"", SS_LEFT, 0, 0, 1, 1, FXC_HELP);   // the preset's explanation
         FxControl(dlg, L"STATIC", L"Divisor:", SS_LEFT, 0, 0, 1, 1, FXC_DIVISOR + 1000);
         FxControl(dlg, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 1, 1, FXC_DIVISOR);
         FxControl(dlg, L"BUTTON", L"Auto", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 0, 1, 1, FXC_AUTODIV);
@@ -8747,7 +8770,10 @@ static INT_PTR CALLBACK FxKernelDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                     if (p == 5) g_fxKernelAutoDiv = false;   // emboss divides by its own amount
                     KernelDlgFill(dlg, s);
                     schedule();
-                } else g_fxKernelPreset = kKernelCustom;
+                } else {
+                    g_fxKernelPreset = kKernelCustom;
+                    SetDlgItemTextW(dlg, FXC_HELP, kKernelPresets[kKernelCustom].help);
+                }
             }
             return TRUE;
         case FXC_SIZE:
@@ -8858,28 +8884,38 @@ static bool DoEffectCommand(UINT id)
     static std::vector<int> vBright, vHue, vLevels, vThresh, vPoster, vNoise, vPixel;
     switch (id) {
     case ID_ADJ_BRIGHTNESS:
-        FxRunSliderDialog(L"Brightness / Contrast", 0,
+        FxRunSliderDialog(L"Brightness / Contrast",
+            L"Brightness makes the whole picture lighter or darker. Contrast pushes colours "
+            L"away from middle gray for a punchier look, or pulls them towards it for a flatter one.", 0,
             { { L"Brightness:", -100, 100, 0, 1 }, { L"Contrast:", -100, 100, 0, 1 } }, vBright,
             [](Img& img, const std::vector<int>& v) { img.brightnessContrast(v[0], v[1]); });
         return true;
     case ID_ADJ_HUESAT:
-        FxRunSliderDialog(L"Hue / Saturation", 0,
+        FxRunSliderDialog(L"Hue / Saturation",
+            L"Hue turns every colour around the colour wheel (red towards yellow, green, blue). "
+            L"Saturation makes colours more vivid or grayer; Lightness moves them towards white or black.", 0,
             { { L"Hue:", -180, 180, 0, 1 }, { L"Saturation:", -100, 100, 0, 1 }, { L"Lightness:", -100, 100, 0, 1 } }, vHue,
             [](Img& img, const std::vector<int>& v) { img.hueSaturation(v[0], v[1], v[2]); });
         return true;
     case ID_ADJ_LEVELS:
-        FxRunSliderDialog(L"Levels", 0,
+        FxRunSliderDialog(L"Levels",
+            L"Values at or below Input black turn black, at or above Input white turn white, "
+            L"and those between are stretched out. Gamma lightens (above 1) or darkens the middle tones.", 0,
             { { L"Input black:", 0, 255, 0, 1 }, { L"Input white:", 0, 255, 255, 1 },
               { L"Gamma:", 10, 500, 100, 100 },
               { L"Output black:", 0, 255, 0, 1 }, { L"Output white:", 0, 255, 255, 1 } }, vLevels,
             [](Img& img, const std::vector<int>& v) { img.levels(v[0], v[1], v[2] / 100.0f, v[3], v[4]); });
         return true;
     case ID_ADJ_THRESHOLD:
-        FxRunSliderDialog(L"Threshold", 0, { { L"Level:", 0, 255, 128, 1 } }, vThresh,
+        FxRunSliderDialog(L"Threshold",
+            L"Turns the picture into pure black and white: pixels at least as bright as the "
+            L"level turn white, the rest black. Lower the level for more white.", 0, { { L"Level:", 0, 255, 128, 1 } }, vThresh,
             [](Img& img, const std::vector<int>& v) { img.threshold(v[0]); });
         return true;
     case ID_ADJ_POSTERIZE:
-        FxRunSliderDialog(L"Posterize", 0, { { L"Levels:", 2, 32, 4, 1 } }, vPoster,
+        FxRunSliderDialog(L"Posterize",
+            L"Uses fewer colours, giving flat bands like a poster: red, green and blue each keep "
+            L"only this many evenly spaced values.", 0, { { L"Levels:", 2, 32, 4, 1 } }, vPoster,
             [](Img& img, const std::vector<int>& v) { img.posterize(v[0]); });
         return true;
     case ID_ADJ_AUTOLEVEL: FxRunInstant([](Img& img) { img.autoLevel(); }); return true;
@@ -8896,12 +8932,15 @@ static bool DoEffectCommand(UINT id)
     case ID_FX_KERNEL:  FxRunKernelDialog(-1); return true;
     case ID_FX_NOISE: {
         unsigned seed = GetTickCount() | 1;   // one grain pattern for the preview and the result
-        FxRunSliderDialog(L"Add Noise", 0, { { L"Amount:", 0, 100, 20, 1 } }, vNoise,
+        FxRunSliderDialog(L"Add Noise",
+            L"Sprinkles random grain over the picture, like film grain. Higher amounts are rougher.", 0, { { L"Amount:", 0, 100, 20, 1 } }, vNoise,
             [seed](Img& img, const std::vector<int>& v) { img.addNoise(v[0], seed); });
         return true;
     }
     case ID_FX_PIXELATE:
-        FxRunSliderDialog(L"Pixelate", 0, { { L"Cell size:", 2, 100, 8, 1 } }, vPixel,
+        FxRunSliderDialog(L"Pixelate",
+            L"Breaks the picture into squares of this many pixels across, each filled with its "
+            L"average colour.", 0, { { L"Cell size:", 2, 100, 8, 1 } }, vPixel,
             [](Img& img, const std::vector<int>& v) { img.pixelate(v[0]); });
         return true;
     }
