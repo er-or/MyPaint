@@ -2251,18 +2251,24 @@ static void LoadImageFromPath(const wchar_t* file)
         HRESULT hrWebP = S_OK;
         const wchar_t* webpStep = nullptr;
         bmp = isWebP ? LoadWebP(file, &hrWebP, &webpStep) : Bitmap::FromFile(file);
-        // GetLastStatus clears the error as it reports it, so ask once and keep the answer
-        bool gdipOk = bmp && bmp->GetLastStatus() == Ok;
-        if (!isWebP && gdipOk) ApplyExifOrientation(bmp, file);
-        if (!isWebP && !gdipOk) {
+        // GetLastStatus clears the error as it reports it, and later calls on the
+        // bitmap (such as looking for an EXIF tag the photo doesn't have) leave
+        // errors of their own behind. So ask once, straight after loading, and keep
+        // the answer.
+        Status gdipStatus = bmp ? bmp->GetLastStatus() : GenericError;
+        bool ok = isWebP ? bmp != nullptr : gdipStatus == Ok;
+        if (!isWebP && ok) ApplyExifOrientation(bmp, file);
+        if (!isWebP && !ok) {
             // GDI+ can't read HEIC, AVIF and some others; Windows' WIC codecs can
             delete bmp;
             DecodedImage img;
             HRESULT hrWic = S_OK;
             bmp = DecodeWicPixels(file, img, &hrWic) ? MakeBitmapFromPixels(img) : nullptr;
             if (!bmp && IsStoreCodecPath(file)) { ShowStoreCodecHelp(file, hrWic); return; }
+            if (bmp) gdipStatus = bmp->GetLastStatus();
+            ok = bmp && gdipStatus == Ok;
         }
-        if (!bmp || (!isWebP && bmp->GetLastStatus() != Ok)) {
+        if (!ok) {
             wchar_t msg[512];
             if (isWebP)
                 StringCchPrintf(msg, ARRAYSIZE(msg),
@@ -2270,8 +2276,7 @@ static void LoadImageFromPath(const wchar_t* file)
                     webpStep ? webpStep : L"(unknown)", (unsigned)hrWebP);
             else
                 StringCchPrintf(msg, ARRAYSIZE(msg),
-                    L"Failed to open image.\nGDI+ status: %d",
-                    bmp ? (int)bmp->GetLastStatus() : -1);
+                    L"Failed to open image.\nGDI+ status: %d", (int)gdipStatus);
             delete bmp;
             MessageBox(g_hwndMain, msg, APP_TITLE, MB_ICONERROR);
             return;
