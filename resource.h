@@ -86,6 +86,7 @@
 #define ID_IMAGE_FLIP_H         40404
 #define ID_IMAGE_FLIP_V         40405
 #define ID_IMAGE_CROP           40406
+#define ID_IMAGE_ROTATE_ANGLE   40407
 
 // Menu item IDs — Image > Adjust and Image > Filters (built in code, see BuildEffectMenus)
 #define ID_ADJ_BRIGHTNESS       40420

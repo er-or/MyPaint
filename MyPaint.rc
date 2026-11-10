@@ -36,6 +36,7 @@ BEGIN
     BEGIN
         MENUITEM "Rotate &Right 90°",       ID_IMAGE_ROTATE_RIGHT
         MENUITEM "Rotate &Left 90°",        ID_IMAGE_ROTATE_LEFT
+        MENUITEM "Rotate by &Angle...",     ID_IMAGE_ROTATE_ANGLE
         MENUITEM "Flip &Horizontal",        ID_IMAGE_FLIP_H
         MENUITEM "Flip &Vertical",          ID_IMAGE_FLIP_V
         MENUITEM SEPARATOR

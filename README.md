@@ -11,7 +11,10 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
 - **Selections:** rectangle, lasso and magic wand, with cut, copy and paste;
   Ctrl+C with nothing selected copies the whole image
 - **Image operations:** rotate, flip, resize, crop to selection (Ctrl+Shift+X),
-  undo and redo
+  undo and redo. **Rotate by Angle** turns by any amount, left or right, in
+  degrees (or radians), with quick buttons for 1°, 2.5°, 5°, 15°, 45° and 90°
+  and a preview; the canvas grows to fit unless you untick that. With a
+  selection, only the selection turns.
 - **Image → Adjust:** brightness/contrast, hue/saturation, levels, threshold and
   posterize, each with sliders, a number box and a live preview on the canvas;
   plus auto level, equalize, invert, grayscale and sepia in one click
