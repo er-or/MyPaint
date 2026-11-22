@@ -1679,6 +1679,7 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr
     IWICBitmapDecoder*     dec   = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
     IWICBitmapFlipRotator* turn  = nullptr;
+    IWICBitmap*            whole = nullptr;   // the decoded frame, held for turning
     IWICFormatConverter*   conv  = nullptr;
     UINT w = 0, h = 0;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -1710,8 +1711,13 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr
             WICBitmapTransformRotate90,
             (WICBitmapTransformOptions)(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
             WICBitmapTransformRotate270 };
-        if (o != 1 && SUCCEEDED(fac->CreateBitmapFlipRotator(&turn)) &&
-            SUCCEEDED(turn->Initialize(frame, kTurn[o])))
+        // Turned straight from the JPEG decoder, each output row of a 90 degree
+        // turn asks for a column of the original, and the decoder starts again
+        // from the top for each one: minutes for a phone photo. So decode it
+        // into memory once (WICBitmapCacheOnLoad) and turn that.
+        if (o != 1 && SUCCEEDED(fac->CreateBitmapFromSource(frame, WICBitmapCacheOnLoad, &whole)) &&
+            SUCCEEDED(fac->CreateBitmapFlipRotator(&turn)) &&
+            SUCCEEDED(turn->Initialize(whole, kTurn[o])))
             src = turn;
     }
     if (SUCCEEDED(hr)) hr = fac->CreateFormatConverter(&conv);
@@ -1727,6 +1733,7 @@ static bool DecodeWicPixels(const wchar_t* file, DecodedImage& out, HRESULT* pHr
     }
     if (conv)  conv->Release();
     if (turn)  turn->Release();
+    if (whole) whole->Release();
     if (frame) frame->Release();
     if (dec)   dec->Release();
     if (fac)   fac->Release();
@@ -9721,6 +9728,7 @@ L"                     (foreground or background) to that swatch.\r\n"
 L"                     Select foreground/background first by clicking\r\n"
 L"                     the FG or BG swatch on the left of the strip.\r\n"
 L"Reset button (\u21BA)     Restore the 16 swatches to their defaults\r\n"
+L"Right-click FG / BG   Copy that colour as rgb(r,g,b) or #RRGGBB\r\n"
 L"\r\n"
 L"Custom colours are saved between sessions.\r\n"
 ;
@@ -19665,19 +19673,34 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     }
 
-    // Right-click on colour strip — same as left click (apply to active target)
+    // Right-click on colour strip: on the FG or BG swatch, makes it active and
+    // offers to copy its colour; on a custom swatch, same as left click
     case WM_RBUTTONDOWN: {
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
         int hit = HitTestColorStrip(x, y, TOOLBAR_HEIGHT);
-        if (hit == 1) {
-            g_strokeActive = true;
+        if (hit == 1 || hit == 2) {
+            g_strokeActive = (hit == 1);
             UpdateAlphaEdit();
-            InvalidateRect(hwnd, NULL, FALSE); return 0;
-        } else if (hit == 2) {
-            g_strokeActive = false;
-            UpdateAlphaEdit();
-            InvalidateRect(hwnd, NULL, FALSE); return 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+            UpdateWindow(hwnd);
+
+            COLORREF c = (hit == 1) ? g_fgColor : g_bgColor;
+            int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+            wchar_t rgb[32], hex[16], rgbItem[48], hexItem[32];
+            StringCchPrintf(rgb, 32, L"rgb(%d,%d,%d)", r, g, b);
+            StringCchPrintf(hex, 16, L"#%02X%02X%02X", r, g, b);
+            StringCchPrintf(rgbItem, 48, L"Copy %s", rgb);
+            StringCchPrintf(hexItem, 32, L"Copy %s", hex);
+            HMENU m = CreatePopupMenu();
+            AppendMenu(m, MF_STRING, 1, rgbItem);
+            AppendMenu(m, MF_STRING, 2, hexItem);
+            POINT sp = { x, y }; ClientToScreen(hwnd, &sp);
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+            if (cmd == 1) CopyTextToClipboard(rgb);
+            else if (cmd == 2) CopyTextToClipboard(hex);
+            return 0;
         } else if (hit >= 3) {
             COLORREF col = g_customColors[hit - 3];
             if (g_strokeActive) { g_fgColor = col; g_fgAlpha = 100; RecreateFillCursor(); RecreateBrushCursors(); UpdateAlphaEdit(); }

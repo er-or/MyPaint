@@ -62,6 +62,9 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   F5 starts a slideshow (3, 5 or 10 seconds per image). The arrow keys and
   scroll wheel step through the folder, Space pauses, Esc returns; moving the
   mouse shows a control bar. A folder browser search limits both to its matches.
+- **Copy a colour:** right-click the foreground or background swatch at the
+  left of the colour strip to copy it as `rgb(r,g,b)` or `#RRGGBB`. Pick a
+  colour from the image with the colour picker first to copy that one.
 - **Dark and light themes** (Ctrl+Shift+D)
 - **Formats:** opens PNG, JPEG, BMP, GIF, TIFF, WebP and SVG; saves PNG, JPEG,
   BMP, GIF, TIFF and WebP.
