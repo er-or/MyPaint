@@ -513,6 +513,8 @@ static HWND  g_hwndLayerRename      = NULL;   // in-place box for a layer's name
 static bool  g_showLayersPanel      = false;
 static const int LAYERS_PANEL_W     = 220;
 static int   g_layersPanelW         = LAYERS_PANEL_W;   // dragging its left edge changes this
+static HWND  g_hwndColorPanel       = NULL;   // docked right of the canvas, in the Layers panel's place
+static bool  g_showColorPanel       = false;  // only one side pane is open at a time
 static HWND  g_hwndSideTabs         = NULL;   // rail of pane tabs, right of the canvas
 static const int SIDE_TABS_W        = 30;
 static HWND  g_hwndFolderSearchEdit = NULL;
@@ -670,6 +672,7 @@ static void InvalidateCanvasView();
 static void UpdateStatusBar(int x, int y);
 static void WandFloodFill(int seedX, int seedY);
 static void RefreshEditingPreview();
+static void NoteColorsUsed();
 static void UpdateTitleBar();
 
 // File ops
@@ -832,6 +835,42 @@ static Color GdipColorFromCOLORREF(COLORREF cr, BYTE alpha)
 // Convert the 0-100 g_fgAlpha / g_bgAlpha percentages to 0-255 bytes for GDI+
 static inline BYTE FgAlphaByte() { return (BYTE)(g_fgAlpha * 255 / 100); }
 static inline BYTE BgAlphaByte() { return (BYTE)(g_bgAlpha * 255 / 100); }
+
+// Paint and stroke style for shapes, set in the Fill and Stroke panel. As in
+// Inkscape: the stroke (foreground colour) and fill (background colour) can
+// each be "No paint", and the stroke has a join, a cap and a miter limit.
+enum { JOIN_MITER, JOIN_ROUND, JOIN_BEVEL };
+enum { CAP_BUTT, CAP_ROUND, CAP_SQUARE };
+static bool  g_strokeNone = false;
+static bool  g_fillNone   = false;
+static int   g_lineJoin   = JOIN_MITER;
+static int   g_lineCap    = CAP_ROUND;   // round, as the line tool always drew; Inkscape starts at butt
+static float g_miterLimit = 4.0f;        // SVG's default: longer miters are bevelled
+
+// Colours recently set in the Fill and Stroke panel or with the colour picker, newest first
+static const int RECENT_COLORS = 8;
+static COLORREF g_recentColors[RECENT_COLORS] = {};
+static int      g_recentColorCount = 0;
+
+// The shape outline colour; see-through when the stroke is "No paint"
+static Color StrokeColor()
+{
+    return GdipColorFromCOLORREF(g_fgColor, g_strokeNone ? 0 : FgAlphaByte());
+}
+
+// Whether shapes are filled: not for "No paint" or a fully see-through fill
+static bool FillOn() { return !g_fillNone && g_bgAlpha > 0; }
+
+static void ApplyStrokeStyle(Pen& pen)
+{
+    // LineJoinMiterClipped bevels a miter past the limit, as SVG does
+    pen.SetLineJoin(g_lineJoin == JOIN_ROUND ? LineJoinRound :
+                    g_lineJoin == JOIN_BEVEL ? LineJoinBevel : LineJoinMiterClipped);
+    pen.SetMiterLimit(g_miterLimit);
+    LineCap cap = g_lineCap == CAP_ROUND ? LineCapRound : g_lineCap == CAP_SQUARE ? LineCapSquare : LineCapFlat;
+    pen.SetStartCap(cap);
+    pen.SetEndCap(cap);
+}
 
 // ============================================================
 //  Canvas helpers
@@ -3475,10 +3514,24 @@ static void LoadSettings()
     if (qv(L"BgColor", &val)) g_bgColor = (COLORREF)val;
     if (qv(L"BgAlpha", &val)) { g_bgAlpha = (int)val; if (g_bgAlpha < 0) g_bgAlpha = 0; if (g_bgAlpha > 100) g_bgAlpha = 100; }
 
+    // Fill and Stroke panel
+    if (qv(L"StrokeNone", &val)) g_strokeNone = (val != 0);
+    if (qv(L"FillNone", &val))   g_fillNone   = (val != 0);
+    if (qv(L"LineJoin", &val) && val <= JOIN_BEVEL) g_lineJoin = (int)val;
+    if (qv(L"LineCap", &val)  && val <= CAP_SQUARE) g_lineCap  = (int)val;
+    if (qv(L"MiterLimit", &val) && val >= 100 && val <= 100000) g_miterLimit = val / 100.0f;   // hundredths
+    g_recentColorCount = 0;
+    for (int i = 0; i < RECENT_COLORS; i++) {
+        wchar_t name[32];
+        StringCchPrintf(name, 32, L"RecentColor%d", i);
+        if (qv(name, &val)) g_recentColors[g_recentColorCount++] = (COLORREF)val;
+    }
+
     if (qv(L"DarkMode", &val)) g_darkMode = (val != 0);
     if (qv(L"FolderBrowserFromFile", &val))  g_folderBrowserFromFile  = (val != 0);
     if (qv(L"FolderBrowserFromBlank", &val)) g_folderBrowserFromBlank = (val != 0);
     if (qv(L"LayersPanel", &val)) g_showLayersPanel = (val != 0);
+    if (qv(L"ColorPanel", &val))  g_showColorPanel  = (val != 0) && !g_showLayersPanel;   // one at a time
     if (qv(L"LayersPanelW", &val) && val >= 170 && val <= 4000) g_layersPanelW = (int)val;
     if (qv(L"FolderSort", &val) && val <= SORT_TYPE) g_folderSort = (int)val;
     if (qv(L"FolderSortDesc", &val)) g_folderSortDesc = (val != 0);
@@ -3569,6 +3622,19 @@ static void SaveSettings()
     sv(L"BgColor",  (DWORD)g_bgColor);
     sv(L"BgAlpha",  (DWORD)g_bgAlpha);
 
+    // Fill and Stroke panel
+    sv(L"StrokeNone", (DWORD)(g_strokeNone ? 1 : 0));
+    sv(L"FillNone",   (DWORD)(g_fillNone ? 1 : 0));
+    sv(L"LineJoin",   (DWORD)g_lineJoin);
+    sv(L"LineCap",    (DWORD)g_lineCap);
+    sv(L"MiterLimit", (DWORD)(g_miterLimit * 100 + 0.5f));
+    for (int i = 0; i < RECENT_COLORS; i++) {
+        wchar_t name[32];
+        StringCchPrintf(name, 32, L"RecentColor%d", i);
+        if (i < g_recentColorCount) sv(name, (DWORD)g_recentColors[i]);
+        else RegDeleteValueW(hKey, name);
+    }
+
     sv(L"DarkMode", (DWORD)(g_darkMode ? 1 : 0));
     // The folder browser state is remembered separately for starting with an
     // image and starting blank; this session updates the one it started as
@@ -3580,6 +3646,7 @@ static void SaveSettings()
     sv(L"FolderBrowserH", (DWORD)g_folderBrowserH);
     sv(L"SlideshowSeconds", (DWORD)g_slideSeconds);
     sv(L"LayersPanel",      (DWORD)(g_showLayersPanel ? 1 : 0));
+    sv(L"ColorPanel",       (DWORD)(g_showColorPanel ? 1 : 0));
     sv(L"LayersPanelW",     (DWORD)g_layersPanelW);
     sv(L"FolderSort",       (DWORD)g_folderSort);
     sv(L"FolderSortDesc",   (DWORD)(g_folderSortDesc ? 1 : 0));
@@ -6797,27 +6864,26 @@ static void RenderPreview(int mx, int my)
 
     switch (g_currentTool) {
     case TOOL_LINE: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
-        pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);   // its ends take the Cap setting
         gfx.DrawLine(&pen, x1, y1, x2, y2);
         break;
     }
     case TOOL_RECT: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillRectangle(&fill, rx, ry, rw, rh); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillRectangle(&fill, rx, ry, rw, rh); }
         gfx.DrawRectangle(&pen, rx, ry, rw, rh);
         break;
     }
     case TOOL_ELLIPSE: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, rx, ry, rw, rh); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, rx, ry, rw, rh); }
         gfx.DrawEllipse(&pen, rx, ry, rw, rh);
         break;
     }
@@ -6836,8 +6902,8 @@ static void RenderPreview(int mx, int my)
         break;
     }
     case TOOL_RRECT: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 4.f || rh < 4.f) break;
@@ -6848,17 +6914,17 @@ static void RenderPreview(int mx, int my)
         path.AddArc(rx+rw-r*2,  ry+rh-r*2,  r*2, r*2,   0.f,  90.f);
         path.AddArc(rx,         ry+rh-r*2,  r*2, r*2,  90.f,  90.f);
         path.CloseFigure();
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_TRIANGLE: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         PointF tri[] = {PointF(rx+rw/2, ry), PointF(rx+rw, ry+rh), PointF(rx, ry+rh)};
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPolygon(&fill, tri, 3); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPolygon(&fill, tri, 3); }
         gfx.DrawPolygon(&pen, tri, 3);
         break;
     }
@@ -6866,8 +6932,8 @@ static void RenderPreview(int mx, int my)
     case TOOL_ARROW_R:
     case TOOL_ARROW_U:
     case TOOL_ARROW_D: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         PointF pts[7];
@@ -6893,12 +6959,12 @@ static void RenderPreview(int mx, int my)
             pts[6]={rx+rw*0.65f,ry};
         }
         GraphicsPath path; path.AddPolygon(pts, 7);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_ARROW: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
+        Color c = StrokeColor();
         REAL dx = x2 - x1, dy = y2 - y1;
         REAL len = sqrtf(dx*dx + dy*dy);
         if (len < 2.f) break;
@@ -6906,15 +6972,15 @@ static void RenderPreview(int mx, int my)
         const REAL HEAD = max(16.f, g_brushSize * 5.f);     // scales with line width
         REAL bx = x2 - ux * HEAD, by = y2 - uy * HEAD;     // arrowhead base centre
         REAL px = -uy * HEAD * 0.4f, py = ux * HEAD * 0.4f; // perpendicular half-width
-        Pen pen(c, g_brushSize); pen.SetStartCap(LineCapSquare); pen.SetEndCap(LineCapFlat);
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen); pen.SetStartCap(LineCapSquare); pen.SetEndCap(LineCapFlat);
         gfx.DrawLine(&pen, x1, y1, bx, by);
         PointF head[] = {PointF(x2, y2), PointF(bx+px, by+py), PointF(bx-px, by-py)};
         SolidBrush br(c); gfx.FillPolygon(&br, head, 3);
         break;
     }
     case TOOL_DIAMOND: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -6925,13 +6991,13 @@ static void RenderPreview(int mx, int my)
             {rx,           ry + rh*0.5f},
         };
         GraphicsPath path; path.AddPolygon(pts, 4);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_PENTAGON: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -6942,14 +7008,14 @@ static void RenderPreview(int mx, int my)
             pts[i] = { cx2 + rw*0.5f*cosf(ang), cy2 + rh*0.5f*sinf(ang) };
         }
         GraphicsPath path; path.AddPolygon(pts, 5);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_HEXAGON_H: {
         // flat top and bottom edges
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -6962,14 +7028,14 @@ static void RenderPreview(int mx, int my)
             {rx,            ry + rh*0.5f},
         };
         GraphicsPath path; path.AddPolygon(pts, 6);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_HEXAGON_V: {
         // flat left and right edges
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -6982,13 +7048,13 @@ static void RenderPreview(int mx, int my)
             {rx,           ry + rh*0.25f},
         };
         GraphicsPath path; path.AddPolygon(pts, 6);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_OCTAGON: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -7004,19 +7070,19 @@ static void RenderPreview(int mx, int my)
             {rx,               ry + rh*k},
         };
         GraphicsPath path; path.AddPolygon(pts, 8);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_STICKMAN: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize); pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen); pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
         REAL cx2 = rx + rw*0.5f;
         REAL headR = min(rw*0.22f, rh*0.18f);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, cx2-headR, ry, headR*2, headR*2); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, cx2-headR, ry, headR*2, headR*2); }
         gfx.DrawEllipse(&pen, cx2-headR, ry, headR*2, headR*2);
         REAL bodyT = ry+headR*2, bodyB = ry+rh*0.62f;
         gfx.DrawLine(&pen, cx2, bodyT, cx2, bodyB);
@@ -7028,8 +7094,8 @@ static void RenderPreview(int mx, int my)
         break;
     }
     case TOOL_SPEECH: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 8.f || rh < 8.f) break;
@@ -7052,15 +7118,15 @@ static void RenderPreview(int mx, int my)
         }
         path.AddArc(rx,         ry+bh-r*2,  r*2, r*2,  90.f, 90.f);
         path.CloseFigure();
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_COMPUTER: {
         // Layout derived from computer_shape.svg (viewBox 0 0 1024 1024)
         // Shape bbox in SVG: x 176-848 (w=672), y 232-792 (h=560)
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 8.f || rh < 8.f) break;
@@ -7075,24 +7141,24 @@ static void RenderPreview(int mx, int my)
             mp.AddArc(rx+rw-cr*2,  ry+mH-cr*2,  cr*2, cr*2,   0, 90);
             mp.AddArc(rx,          ry+mH-cr*2,  cr*2, cr*2,  90, 90);
             mp.CloseFigure();
-            if (g_bgAlpha > 0) gfx.FillPath(&bgFill, &mp);
+            if (FillOn()) gfx.FillPath(&bgFill, &mp);
             gfx.DrawPath(&pen, &mp);
         }
         // Inner screen rect (stroke only — bezel is the gap between outer and screen)
         gfx.DrawRectangle(&pen, rx+rw*0.071f, ry+rh*0.086f, rw*0.857f, rh*0.629f);
         // Neck
         REAL nX = rx+rw*0.452f, nY = ry+rh*0.771f, nW = rw*0.071f, nH = rh*0.171f;
-        if (g_bgAlpha > 0) gfx.FillRectangle(&bgFill, nX, nY, nW, nH);
+        if (FillOn()) gfx.FillRectangle(&bgFill, nX, nY, nW, nH);
         gfx.DrawRectangle(&pen, nX, nY, nW, nH);
         // Base
         REAL bX = rx+rw*0.381f, bY = ry+rh*0.914f, bW = rw*0.214f, bH = rh*0.086f;
-        if (g_bgAlpha > 0) gfx.FillRectangle(&bgFill, bX, bY, bW, bH);
+        if (FillOn()) gfx.FillRectangle(&bgFill, bX, bY, bW, bH);
         gfx.DrawRectangle(&pen, bX, bY, bW, bH);
         break;
     }
     case TOOL_STAR: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         REAL cx2 = rx+rw*0.5f, cy2 = ry+rh*0.5f;
@@ -7104,13 +7170,13 @@ static void RenderPreview(int mx, int my)
             pts[i] = PointF(cx2 + (i%2==0?orx:irx)*cosf(ang),
                             cy2 + (i%2==0?ory:iry)*sinf(ang));
         }
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPolygon(&fill, pts, 10); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPolygon(&fill, pts, 10); }
         gfx.DrawPolygon(&pen, pts, 10);
         break;
     }
     case TOOL_HEART: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 4.f || rh < 4.f) break;
@@ -7119,15 +7185,15 @@ static void RenderPreview(int mx, int my)
         // Map from viewBox space to drawing rect (non-uniform scale preserves shape)
         Matrix mat(rw / kHeartVW, 0, 0, rh / kHeartVH, rx, ry);
         path.Transform(&mat);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_LIGHTNING: {
         // 6-point polygon derived from lightning_shape.svg (viewBox 0 0 1024 1024)
         // Shape bbox in SVG: x 262-771 (w=508), y 152-865 (h=713)
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         PointF pts[] = {
@@ -7139,13 +7205,13 @@ static void RenderPreview(int mx, int my)
             {rx+rw*0.586f, ry+rh*0.421f  },  // inner notch right
         };
         GraphicsPath lpath; lpath.AddPolygon(pts, 6);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &lpath); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &lpath); }
         gfx.DrawPath(&pen, &lpath);
         break;
     }
     case TOOL_MUSTACHE: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f) rw = 2.f; if (rh < 2.f) rh = 2.f;
@@ -7153,10 +7219,10 @@ static void RenderPreview(int mx, int my)
         REAL gh = rh * 0.55f;
         REAL lensW = rw * 0.38f, lensH = gh;
         // Left lens
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, rx, ry, lensW, lensH); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, rx, ry, lensW, lensH); }
         gfx.DrawEllipse(&pen, rx,             ry, lensW, lensH);
         // Right lens
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, rx+rw-lensW, ry, lensW, lensH); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillEllipse(&fill, rx+rw-lensW, ry, lensW, lensH); }
         gfx.DrawEllipse(&pen, rx+rw-lensW,    ry, lensW, lensH);
         // Bridge between inner edges
         REAL bridgeY = ry + lensH * 0.5f;
@@ -7178,8 +7244,8 @@ static void RenderPreview(int mx, int my)
         break;
     }
     case TOOL_SPIRAL: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
@@ -7203,8 +7269,8 @@ static void RenderPreview(int mx, int my)
         break;
     }
     case TOOL_SPIRAL_R: {
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
@@ -7227,8 +7293,8 @@ static void RenderPreview(int mx, int my)
     }
     case TOOL_CROSS: {
         // Plus / cross shape — 12-point polygon on 24×24 viewBox
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -7238,14 +7304,14 @@ static void RenderPreview(int mx, int my)
         PointF pts[12];
         for (int i = 0; i < 12; i++) pts[i] = PointF(rx + kCrossX[i]*sx, ry + kCrossY[i]*sy);
         GraphicsPath path; path.AddPolygon(pts, 12);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_XMARK: {
         // Diagonal X shape — 12-point polygon on 24×24 viewBox
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -7256,14 +7322,14 @@ static void RenderPreview(int mx, int my)
         PointF pts[12];
         for (int i = 0; i < 12; i++) pts[i] = PointF(rx + kXX[i]*sx, ry + kXY[i]*sy);
         GraphicsPath path; path.AddPolygon(pts, 12);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
     case TOOL_CHECK: {
         // Checkmark / tick — 6-point polygon on 24×24 viewBox
-        Color c = GdipColorFromCOLORREF(g_fgColor, FgAlphaByte());
-        Pen pen(c, g_brushSize);
+        Color c = StrokeColor();
+        Pen pen(c, g_brushSize); ApplyStrokeStyle(pen);
         REAL rx = min(x1,x2), ry = min(y1,y2);
         REAL rw = fabsf(x2-x1), rh = fabsf(y2-y1);
         if (rw < 2.f || rh < 2.f) break;
@@ -7273,7 +7339,7 @@ static void RenderPreview(int mx, int my)
         PointF pts[6];
         for (int i = 0; i < 6; i++) pts[i] = PointF(rx + kCkX[i]*sx, ry + kCkY[i]*sy);
         GraphicsPath path; path.AddPolygon(pts, 6);
-        if (g_bgAlpha > 0) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
+        if (FillOn()) { SolidBrush fill(GdipColorFromCOLORREF(g_bgColor, BgAlphaByte())); gfx.FillPath(&fill, &path); }
         gfx.DrawPath(&pen, &path);
         break;
     }
@@ -9730,6 +9796,20 @@ L"                     the FG or BG swatch on the left of the strip.\r\n"
 L"Reset button (\u21BA)     Restore the 16 swatches to their defaults\r\n"
 L"Right-click FG / BG   Copy that colour as rgb(r,g,b) or #RRGGBB\r\n"
 L"\r\n"
+L"FILL AND STROKE  (palette button in the colour strip, or the side tab)\r\n"
+L"---------------\r\n"
+L"A panel at the right, as in Inkscape, with three tabs:\r\n"
+L"Fill            The background colour, which fills shapes\r\n"
+L"Stroke paint    The foreground colour: outlines, lines, pencil, brushes\r\n"
+L"Stroke style    Width, and the Join and Cap of shape outlines and lines\r\n"
+L"\r\n"
+L"On Fill and Stroke paint, the first buttons pick No paint (shapes get no\r\n"
+L"fill, or no outline) or Flat color. Flat colours have R, G, B and A\r\n"
+L"sliders (A is opacity, 0-100), hex and CSS boxes with copy buttons,\r\n"
+L"recent colours (ones you've drawn with) and the palette. The hex box\r\n"
+L"also takes #RGB and #RRGGBBAA; the CSS box takes rgb() and rgba().\r\n"
+L"Drag the panel's left edge to resize it.\r\n"
+L"\r\n"
 L"Custom colours are saved between sessions.\r\n"
 ;
         if (hEdit) SetWindowText(hEdit, help);
@@ -10857,6 +10937,8 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         g_drawing = true;
         g_ptStart = pt;
         g_ptLast  = pt;
+
+        NoteColorsUsed();   // the Fill and Stroke panel's Recent colours
 
         switch (g_currentTool) {
         case TOOL_SMUDGE:
@@ -16917,8 +16999,14 @@ static bool LpHandleEscKey(const MSG& msg)
     return true;
 }
 
+static void ToggleColorPanel();
+
 static void ToggleLayersPanel()
 {
+    if (!g_showLayersPanel && g_showColorPanel) {   // one pane at a time: the Colour panel makes way
+        g_showColorPanel = false;
+        if (g_hwndColorPanel) ShowWindow(g_hwndColorPanel, SW_HIDE);
+    }
     g_showLayersPanel = !g_showLayersPanel;
     if (g_hwndSideTabs) InvalidateRect(g_hwndSideTabs, NULL, FALSE);
     if (!g_hwndLayersPanel) return;
@@ -16933,14 +17021,727 @@ static void ToggleLayersPanel()
 
 // ─── Side tabs ───────────────────────────────────────────────
 // A narrow rail at the right of the canvas with one vertical tab per side pane.
-// The open pane sits against the rail, and its tab joins onto it. Layers is the
-// only pane so far; a colour mixer or others would add a tab to the list here.
+// The open pane sits against the rail, and its tab joins onto it. One pane is
+// open at a time: Layers or Colour.
 static const int ST_TAB_TOP = 6, ST_TAB_H = 38;
-enum { STAB_LAYERS, STAB_COUNT };
+enum { STAB_LAYERS, STAB_COLOR, STAB_COUNT };
 static int g_stHot = -1;
 
 static RECT StTabRect(int t) { return { 0, ST_TAB_TOP + t * (ST_TAB_H + 2), SIDE_TABS_W, ST_TAB_TOP + t * (ST_TAB_H + 2) + ST_TAB_H }; }
-static bool StTabOpen(int t) { return t == STAB_LAYERS && g_showLayersPanel; }
+static bool StTabOpen(int t) { return (t == STAB_LAYERS && g_showLayersPanel) || (t == STAB_COLOR && g_showColorPanel); }
+
+static void DrawAlphaSwatch(HDC hdc, const RECT& rc, COLORREF color, BYTE alpha);
+
+// ─── Fill and Stroke panel ───────────────────────────────────
+// Modelled on Inkscape's Fill and Stroke dialog, with three tabs:
+//   Fill          the background colour, which fills shapes
+//   Stroke paint  the foreground colour: shape outlines, lines, pencil, brushes
+//   Stroke style  line width, and the join and cap of shape outlines
+// Each paint tab picks No paint or Flat color; flat colours get R, G, B and
+// alpha sliders (alpha 0-100, as in Inkscape and the Opacity box), hex and CSS
+// boxes with copy buttons, recent colours and the palette. The top colour
+// button opens it. Gradients, patterns and dashes may follow.
+static void ToggleColorPanel()
+{
+    if (!g_showColorPanel && g_showLayersPanel) {   // one pane at a time: Layers makes way
+        EndLayerRename(true);
+        g_showLayersPanel = false;
+        if (g_hwndLayersPanel) ShowWindow(g_hwndLayersPanel, SW_HIDE);
+        LpFreeThumbs();
+    }
+    g_showColorPanel = !g_showColorPanel;
+    if (g_hwndSideTabs) InvalidateRect(g_hwndSideTabs, NULL, FALSE);
+    if (!g_hwndColorPanel) return;
+    if (!g_showColorPanel) ShowWindow(g_hwndColorPanel, SW_HIDE);
+    LayoutCanvasAndFolderBrowser(g_hwndMain);
+    if (g_showColorPanel) { InvalidateRect(g_hwndColorPanel, NULL, FALSE); ShowWindow(g_hwndColorPanel, SW_SHOW); }
+    if (g_zoomFitMode) ZoomToFit(); else CenterScrollOnCanvas();
+    InvalidateCanvas();
+}
+
+enum { CPT_FILL, CPT_STROKE, CPT_STYLE };                       // the panel's tabs
+enum { CPE_R, CPE_G, CPE_B, CPE_A, CPE_HEX, CPE_CSS, CPE_WIDTH, CPE_MITER, CPE_COUNT };   // its typing boxes
+static int   g_cpTab      = CPT_STROKE;
+static HWND  g_cpEdit[CPE_COUNT] = {};
+static HWND  g_cpTip      = NULL;
+static HFONT g_cpFont     = NULL, g_cpBold = NULL;
+static bool  g_cpUpdating = false;   // filling the boxes in: their change notices are ours
+static int   g_cpDrag     = -1;      // the slider being dragged: 0-3 = R, G, B, A
+static bool  g_cpResizing = false;   // dragging the panel's left edge
+static int   g_cpResizeX0 = 0, g_cpResizeW0 = 0;
+static const int CP_M = 10, CP_LABEL_W = 74;
+
+// Everything's place, worked out from the panel's width
+struct CpLayout {
+    RECT tab[3];
+    RECT mode[2];                 // No paint, Flat color
+    int  titleY;
+    RECT track[4], num[4];        // R, G, B, A
+    RECT hexBox, cssBox, hexCopy, cssCopy;
+    int  recentY, paletteY, swatch;
+    RECT width, join[3], miter, cap[3];
+    int  widthY, joinY, miterY, capY;
+};
+
+static CpLayout CpGetLayout(HDC hdc, int W)
+{
+    CpLayout L = {};
+    const int M = CP_M, right = W - M;
+    // Tabs, as wide as their names
+    static const wchar_t* kTabs[3] = { L"Fill", L"Stroke paint", L"Stroke style" };
+    int x = 8;   // clear of the left edge, which resizes the panel
+    HFONT old = (HFONT)SelectObject(hdc, g_cpFont);
+    for (int i = 0; i < 3; i++) {
+        SIZE sz; GetTextExtentPoint32W(hdc, kTabs[i], (int)wcslen(kTabs[i]), &sz);
+        L.tab[i] = { x, 6, x + sz.cx + 16, 32 };
+        x = L.tab[i].right;
+    }
+    SelectObject(hdc, old);
+
+    // Fill and Stroke paint
+    for (int i = 0; i < 2; i++) L.mode[i] = { M + i * 34, 42, M + i * 34 + 30, 68 };
+    L.titleY = 78;
+    const int numW = 44;
+    for (int i = 0; i < 4; i++) {
+        int y = 104 + i * 34;
+        L.track[i] = { M + 18, y + 5, right - numW - 8, y + 23 };
+        L.num[i]   = { right - numW, y + 3, right, y + 25 };
+    }
+    // Hex and CSS boxes are as wide as their longest text needs, not the panel
+    int hexR = min(M + 36 + 150, right - 28), cssR = hexR;   // the same width, so they line up
+    L.hexBox  = { M + 36, 250, hexR, 272 };
+    L.hexCopy = { hexR + 4, 250, hexR + 28, 272 };
+    L.cssBox  = { M + 36, 278, cssR, 300 };
+    L.cssCopy = { cssR + 4, 278, cssR + 28, 300 };
+    L.swatch  = max(10, min(26, (W - 2 * M - 7 * 4) / 8));   // eight to a row, and no bigger than needed
+    L.recentY  = 314;
+    L.paletteY = L.recentY + 20 + L.swatch + 12;
+
+    // Stroke style
+    const int cx = M + CP_LABEL_W;
+    L.widthY = 46;  L.width = { cx, L.widthY, cx + 60, L.widthY + 22 };
+    L.joinY  = 84;  for (int i = 0; i < 3; i++) L.join[i] = { cx + i * 38, L.joinY - 2, cx + i * 38 + 34, L.joinY + 28 };
+    L.miterY = 124; L.miter = { cx, L.miterY, cx + 60, L.miterY + 22 };
+    L.capY   = 162; for (int i = 0; i < 3; i++) L.cap[i] = { cx + i * 38, L.capY - 2, cx + i * 38 + 34, L.capY + 28 };
+    return L;
+}
+
+static CpLayout CpGetLayout(HWND hwnd)
+{
+    RECT rc; GetClientRect(hwnd, &rc);
+    HDC hdc = GetDC(hwnd);
+    CpLayout L = CpGetLayout(hdc, rc.right);
+    ReleaseDC(hwnd, hdc);
+    return L;
+}
+
+// The colour the open tab edits: the fill (background) or the stroke (foreground)
+static bool     CpIsFill()  { return g_cpTab == CPT_FILL; }
+static COLORREF CpColor()   { return CpIsFill() ? g_bgColor : g_fgColor; }
+static int      CpAlpha()   { return CpIsFill() ? g_bgAlpha : g_fgAlpha; }
+static bool     CpNone()    { return CpIsFill() ? g_fillNone : g_strokeNone; }
+
+// Puts a colour at the front of Recent, unless it's already there somewhere;
+// the oldest drops off the end
+static void AddRecentColor(COLORREF c)
+{
+    for (int i = 0; i < g_recentColorCount; i++) if (g_recentColors[i] == c) return;
+    if (g_recentColorCount < RECENT_COLORS) g_recentColorCount++;
+    for (int i = g_recentColorCount - 1; i > 0; i--) g_recentColors[i] = g_recentColors[i - 1];
+    g_recentColors[0] = c;
+    if (g_hwndColorPanel && g_showColorPanel) InvalidateRect(g_hwndColorPanel, NULL, FALSE);
+}
+
+// A colour counts as used once it goes on the picture: called as the mouse
+// goes down on the canvas, with the stroke and fill the current tool uses
+static void NoteColorsUsed()
+{
+    switch (g_currentTool) {
+    case TOOL_ERASER: case TOOL_SMUDGE: case TOOL_SELECT: case TOOL_WAND:
+    case TOOL_LASSO:  case TOOL_DROPPER: case TOOL_HAND:
+        return;   // these paint no colour of their own
+    case TOOL_PENCIL: case TOOL_BRUSH: case TOOL_FILL: case TOOL_TEXT:
+        AddRecentColor(g_fgColor);
+        return;
+    default:      // shapes and lines: the outline, and the fill if there is one
+        if (!g_strokeNone) AddRecentColor(g_fgColor);
+        if (FillOn() && g_currentTool != TOOL_LINE) AddRecentColor(g_bgColor);
+        return;
+    }
+}
+
+// "#RRGGBB", or "#RRGGBBAA" when it isn't fully opaque
+static std::wstring CpHexText(COLORREF c, int alpha)
+{
+    wchar_t s[16];
+    if (alpha >= 100) StringCchPrintf(s, 16, L"#%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+    else StringCchPrintf(s, 16, L"#%02X%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c), alpha * 255 / 100);
+    return s;
+}
+
+// "rgb(r,g,b)", or "rgba(r,g,b,0.5)" when it isn't fully opaque
+static std::wstring CpCssText(COLORREF c, int alpha)
+{
+    wchar_t s[48];
+    if (alpha >= 100) StringCchPrintf(s, 48, L"rgb(%d,%d,%d)", GetRValue(c), GetGValue(c), GetBValue(c));
+    else {
+        StringCchPrintf(s, 48, L"rgba(%d,%d,%d,%.2f", GetRValue(c), GetGValue(c), GetBValue(c), alpha / 100.0);
+        std::wstring t = s;   // 0.50 -> 0.5
+        while (t.back() == L'0') t.pop_back();
+        if (t.back() == L'.') t.pop_back();
+        return t + L")";
+    }
+    return s;
+}
+
+// Reads #RGB, #RRGGBB or #RRGGBBAA (the # is optional)
+static bool CpParseHex(const wchar_t* text, COLORREF& c, int& alpha)
+{
+    std::wstring h;
+    for (const wchar_t* p = text; *p; p++) if (iswxdigit(*p)) h += *p; else if (*p != L'#' && *p != L' ') return false;
+    if (h.size() == 3) h = { h[0], h[0], h[1], h[1], h[2], h[2] };
+    if (h.size() != 6 && h.size() != 8) return false;
+    unsigned v = wcstoul(h.substr(0, 6).c_str(), nullptr, 16);
+    c = RGB((v >> 16) & 255, (v >> 8) & 255, v & 255);
+    // Without alpha digits the colour is opaque, as the box shows it
+    alpha = h.size() == 8 ? (int)(wcstoul(h.substr(6).c_str(), nullptr, 16) * 100 / 255.0 + 0.5) : 100;
+    return true;
+}
+
+// Reads rgb(r,g,b) or rgba(r,g,b,a), a from 0 to 1 or a percentage
+static bool CpParseCss(const wchar_t* text, COLORREF& c, int& alpha)
+{
+    std::wstring t;
+    for (const wchar_t* p = text; *p; p++) if (*p != L' ') t += (wchar_t)towlower(*p);
+    int r, g, b; double a = 1; wchar_t pct = 0;
+    if (swscanf_s(t.c_str(), L"rgba(%d,%d,%d,%lf%c", &r, &g, &b, &a, &pct, 1) >= 4) {
+        if (pct == L'%') a /= 100;
+    } else if (swscanf_s(t.c_str(), L"rgb(%d,%d,%d)", &r, &g, &b) != 3) return false;
+    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255 || a < 0 || a > 1) return false;
+    c = RGB(r, g, b);
+    alpha = (int)(a * 100 + 0.5);
+    return true;
+}
+
+// Fills in the typing boxes, except the one being typed in
+static void CpSyncEdits()
+{
+    if (!g_cpEdit[0]) return;
+    g_cpUpdating = true;
+    HWND focus = GetFocus();
+    auto put = [&](int i, const std::wstring& s) {
+        if (g_cpEdit[i] == focus) return;
+        wchar_t cur[64]; GetWindowTextW(g_cpEdit[i], cur, 64);
+        if (s != cur) SetWindowTextW(g_cpEdit[i], s.c_str());
+    };
+    COLORREF c = CpColor();
+    int a = CpAlpha();
+    put(CPE_R, std::to_wstring(GetRValue(c)));
+    put(CPE_G, std::to_wstring(GetGValue(c)));
+    put(CPE_B, std::to_wstring(GetBValue(c)));
+    put(CPE_A, std::to_wstring(a));
+    put(CPE_HEX, CpHexText(c, a));
+    put(CPE_CSS, CpCssText(c, a));
+    wchar_t num[16];
+    if (g_brushSize == floorf(g_brushSize)) StringCchPrintf(num, 16, L"%d", (int)g_brushSize);
+    else StringCchPrintf(num, 16, L"%.1f", g_brushSize);
+    put(CPE_WIDTH, num);
+    StringCchPrintf(num, 16, L"%g", g_miterLimit);
+    put(CPE_MITER, num);
+    g_cpUpdating = false;
+}
+
+// Places the typing boxes for the open tab, and points the tooltips at what shows
+static void CpPlace()
+{
+    if (!g_hwndColorPanel || !g_cpEdit[0]) return;
+    CpLayout L = CpGetLayout(g_hwndColorPanel);
+    bool flat = g_cpTab != CPT_STYLE && !CpNone(), style = g_cpTab == CPT_STYLE;
+    auto place = [&](int i, RECT r, bool show) {
+        SetWindowPos(g_cpEdit[i], NULL, r.left + 4, r.top + 4, r.right - r.left - 8, r.bottom - r.top - 7,
+                     SWP_NOZORDER | SWP_NOACTIVATE | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+    };
+    for (int i = 0; i < 4; i++) place(CPE_R + i, L.num[i], flat);
+    place(CPE_HEX, L.hexBox, flat);
+    place(CPE_CSS, L.cssBox, flat);
+    place(CPE_WIDTH, L.width, style);
+    place(CPE_MITER, L.miter, style);
+
+    if (g_cpTip) {
+        RECT none = {};
+        auto tip = [&](UINT id, RECT r, bool show) {
+            TOOLINFOW ti = { sizeof(ti) };
+            ti.hwnd = g_hwndColorPanel; ti.uId = id; ti.rect = show ? r : none;
+            SendMessage(g_cpTip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+        };
+        bool paint = !style;
+        tip(1, L.mode[0], paint);
+        tip(2, L.mode[1], paint);
+        tip(3, L.hexCopy, flat);
+        tip(4, L.cssCopy, flat);
+        for (int i = 0; i < 3; i++) { tip(10 + i, L.join[i], style); tip(20 + i, L.cap[i], style); }
+    }
+}
+
+// Brings the panel up to date after the colours or line width changed elsewhere
+static void CpSync()
+{
+    if (!g_hwndColorPanel || !g_showColorPanel) return;
+    if (g_cpTab != CPT_STYLE) g_cpTab = g_strokeActive ? CPT_STROKE : CPT_FILL;
+    CpPlace();
+    CpSyncEdits();
+    InvalidateRect(g_hwndColorPanel, NULL, FALSE);
+}
+
+// Everything that has to follow a change of colour, paint or style
+static void CpChanged()
+{
+    if (!CpIsFill()) { RecreateFillCursor(); RecreateBrushCursors(); }   // they show the stroke colour
+    UpdateAlphaEdit();
+    RefreshEditingPreview();
+    if (g_hwndMain) {   // just the colour strip (it calls CpSync), so the rest doesn't flicker
+        RECT rc; GetClientRect(g_hwndMain, &rc);
+        RECT strip = { 0, TOOLBAR_HEIGHT, rc.right, TOOLBAR_HEIGHT + COLORSTRIP_H };
+        InvalidateRect(g_hwndMain, &strip, FALSE);
+    }
+    CpPlace();
+    CpSyncEdits();
+    if (g_hwndColorPanel) InvalidateRect(g_hwndColorPanel, NULL, FALSE);
+}
+
+static void CpSetColor(COLORREF c, int alpha)
+{
+    alpha = max(0, min(100, alpha));
+    if (CpIsFill()) { g_bgColor = c; g_bgAlpha = alpha; g_fillNone = false; }
+    else            { g_fgColor = c; g_fgAlpha = alpha; g_strokeNone = false; }
+    CpChanged();
+}
+
+static void CpSetNone(bool none)
+{
+    if (CpIsFill()) g_fillNone = none; else g_strokeNone = none;
+    CpChanged();
+}
+
+static void CpSetTab(int tab)
+{
+    g_cpTab = tab;
+    if (tab == CPT_FILL)   g_strokeActive = false;   // the colour strip's swatches follow
+    if (tab == CPT_STROKE) g_strokeActive = true;
+    CpChanged();
+}
+
+// Reads a typing box once it's finished with (Enter, or leaving it)
+static void CpCommitEdit(int i)
+{
+    wchar_t text[64]; GetWindowTextW(g_cpEdit[i], text, 64);
+    COLORREF c = CpColor(); int a = CpAlpha();
+    if (i == CPE_HEX || i == CPE_CSS) {
+        if ((i == CPE_HEX ? CpParseHex(text, c, a) : CpParseCss(text, c, a)) && (c != CpColor() || a != CpAlpha()))
+            CpSetColor(c, a);
+    } else if (i == CPE_WIDTH) {
+        float w = (float)_wtof(text);
+        if (w >= MIN_BRUSH_SZ && w <= MAX_BRUSH_SZ) { g_brushSize = w; UpdateBrushSizeEdit(); CpChanged(); }
+    } else if (i == CPE_MITER) {
+        float m = (float)_wtof(text);
+        if (m >= 1 && m <= 1000) { g_miterLimit = m; CpChanged(); }
+    }
+    HWND f = GetFocus();
+    if (f == g_cpEdit[i]) SetFocus(g_hwndColorPanel);   // let the box be refilled
+    CpSyncEdits();
+    if (f == g_cpEdit[i]) { SetFocus(f); SendMessage(f, EM_SETSEL, 0, -1); }
+}
+
+// The R, G, B and A boxes take effect as they're typed in. So does the hex box
+// once it holds 6 digits (RRGGBB) or 8 (RRGGBBAA: the last two set alpha), so
+// typing two more after the colour sets its opacity straight away.
+static void CpEditChanged(int i)
+{
+    if (i == CPE_HEX) {
+        wchar_t text[64]; GetWindowTextW(g_cpEdit[i], text, 64);
+        int digits = 0;
+        for (const wchar_t* p = text; *p; p++) if (iswxdigit(*p)) digits++;
+        COLORREF c = CpColor(); int a = CpAlpha();
+        if ((digits == 6 || digits == 8) && CpParseHex(text, c, a) && (c != CpColor() || a != CpAlpha()))
+            CpSetColor(c, a);
+        return;
+    }
+    if (i > CPE_A) return;
+    wchar_t text[16]; GetWindowTextW(g_cpEdit[i], text, 16);
+    if (!text[0]) return;
+    int v = _wtoi(text);
+    if (v < 0 || v > (i == CPE_A ? 100 : 255)) return;
+    COLORREF c = CpColor(); int a = CpAlpha();
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    if (i == CPE_R) r = v; else if (i == CPE_G) g = v; else if (i == CPE_B) b = v; else a = v;
+    CpSetColor(RGB(r, g, b), a);
+}
+
+static LRESULT CALLBACK CpEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR)
+{
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) { CpCommitEdit((int)id); return 0; }
+    if (msg == WM_CHAR && (wParam == L'\r' || wParam == L'\n')) return 0;   // no beep
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) { SetFocus(g_hwndCanvas); return 0; }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Moves a slider's colour channel to where the mouse is along its track
+static void CpDragTo(const CpLayout& L, int i, int x)
+{
+    const RECT& t = L.track[i];
+    int top = i == 3 ? 100 : 255;
+    int v = (int)((x - t.left) * top / (double)max(1, (int)(t.right - t.left)) + 0.5);
+    v = max(0, min(top, v));
+    COLORREF c = CpColor(); int a = CpAlpha();
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    if (i == 0) r = v; else if (i == 1) g = v; else if (i == 2) b = v; else a = v;
+    if (RGB(r, g, b) != c || a != CpAlpha()) CpSetColor(RGB(r, g, b), a);
+}
+
+// The corner or line end a Join or Cap button shows
+static void CpDrawStyleIcon(Graphics& g, const RECT& r, bool isJoin, int kind, const Color& ink)
+{
+    float x = (float)r.left, y = (float)r.top, w = (float)(r.right - r.left), h = (float)(r.bottom - r.top);
+    Pen thick(ink, isJoin ? 12.f : 8.f);
+    if (isJoin) {
+        thick.SetLineJoin(kind == JOIN_ROUND ? LineJoinRound : kind == JOIN_BEVEL ? LineJoinBevel : LineJoinMiter);
+        float cx = x + 15, cy = y + 14;   // the corner, with room around its outside
+        PointF pts[3] = { PointF(cx, y + h + 4), PointF(cx, cy), PointF(x + w + 4, cy) };
+        g.SetClip(RectF(x + 1, y + 1, w - 2, h - 2));
+        g.DrawLines(&thick, pts, 3);
+        g.ResetClip();
+    } else {
+        thick.SetStartCap(LineCapFlat);
+        thick.SetEndCap(kind == CAP_ROUND ? LineCapRound : kind == CAP_SQUARE ? LineCapSquare : LineCapFlat);
+        float cy = y + h / 2, endX = x + w / 2 + 1;
+        g.SetClip(RectF(x + 1, y + 1, w - 2, h - 2));
+        g.DrawLine(&thick, x - 2, cy, endX, cy);
+        g.ResetClip();
+        Pen guide(Color(255, 0, 120, 215), 1.f);   // where the line ends
+        g.DrawLine(&guide, endX, y + 5, endX, y + h - 5);
+    }
+}
+
+static void CpPaint(HWND hwnd, Graphics& g, int W, int H)
+{
+    const bool dark = g_darkMode;
+    Color bgC   = dark ? Color(255, 28, 28, 28)    : Color(255, 235, 235, 235);
+    Color inkC  = dark ? Color(255, 220, 220, 220) : Color(255, 40, 40, 40);
+    Color dimC  = dark ? Color(255, 140, 140, 140) : Color(255, 110, 110, 110);
+    Color lineC = dark ? Color(255, 70, 70, 70)    : Color(255, 180, 180, 180);
+    Color boxC  = dark ? Color(255, 45, 45, 45)    : Color(255, 255, 255, 255);
+    Color selC  = dark ? Color(255, 55, 65, 80)    : Color(255, 204, 228, 247);
+    Color accC(255, 0, 120, 215);
+    g.Clear(bgC);
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+    HDC fdc = GetDC(hwnd);
+    CpLayout L = CpGetLayout(fdc, W);
+    Font fText(fdc, g_cpFont), fBold(fdc, g_cpBold);
+    ReleaseDC(hwnd, fdc);
+    SolidBrush ink(inkC), dim(dimC), box(boxC), sel(selC), acc(accC);
+    Pen line(lineC, 1.f);
+    StringFormat mid; mid.SetAlignment(StringAlignmentCenter); mid.SetLineAlignment(StringAlignmentCenter);
+    StringFormat left; left.SetLineAlignment(StringAlignmentCenter);
+    auto rectF = [](const RECT& r) { return RectF((REAL)r.left, (REAL)r.top, (REAL)(r.right - r.left), (REAL)(r.bottom - r.top)); };
+    auto frame = [&](const RECT& r) { g.DrawRectangle(&line, (INT)r.left, (INT)r.top, (INT)(r.right - r.left - 1), (INT)(r.bottom - r.top - 1)); };
+    // A toggle button: highlighted when chosen
+    // outlined = whether an unchosen one still shows its outline
+    auto button = [&](const RECT& r, bool on, bool outlined = true) {
+        if (on) { g.FillRectangle(&sel, rectF(r)); Pen p(accC, 1.f); g.DrawRectangle(&p, (INT)r.left, (INT)r.top, (INT)(r.right - r.left - 1), (INT)(r.bottom - r.top - 1)); }
+        else if (outlined) frame(r);
+    };
+    auto label = [&](const wchar_t* s, int x, int y, int h, Brush* b) {
+        g.DrawString(s, -1, &fText, RectF((REAL)x, (REAL)y, 200.f, (REAL)h), &left, b);
+    };
+
+    // Tabs, the open one underlined
+    static const wchar_t* kTabs[3] = { L"Fill", L"Stroke paint", L"Stroke style" };
+    for (int i = 0; i < 3; i++) {
+        g.DrawString(kTabs[i], -1, i == g_cpTab ? &fBold : &fText, rectF(L.tab[i]), &mid, i == g_cpTab ? &ink : &dim);
+        if (i == g_cpTab) g.FillRectangle(&acc, (INT)L.tab[i].left + 4, (INT)L.tab[i].bottom - 3, (INT)(L.tab[i].right - L.tab[i].left - 8), 3);
+    }
+    SolidBrush rule(lineC);
+    g.FillRectangle(&rule, 0, (INT)L.tab[0].bottom, W, 1);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+
+    if (g_cpTab != CPT_STYLE) {
+        bool none = CpNone();
+        // Paint: No paint (a cross) or Flat color (a filled square)
+        button(L.mode[0], none, false);
+        button(L.mode[1], !none, false);
+        {
+            Pen x(inkC, 1.6f);
+            const RECT& r = L.mode[0];
+            float cx = (r.left + r.right) / 2.f, cy = (r.top + r.bottom) / 2.f;
+            g.DrawLine(&x, cx - 5, cy - 5, cx + 5, cy + 5);
+            g.DrawLine(&x, cx + 5, cy - 5, cx - 5, cy + 5);
+            const RECT& f = L.mode[1];
+            g.FillRectangle(&ink, (REAL)(f.left + f.right) / 2 - 6, (REAL)(f.top + f.bottom) / 2 - 6, 12.f, 12.f);
+        }
+        g.DrawString(none ? L"No paint" : L"Flat color", -1, &fBold, PointF((REAL)CP_M - 1, (REAL)L.titleY), &ink);
+        if (none) return;
+
+        // R, G, B and A sliders, each track showing what sliding it would make
+        COLORREF c = CpColor();
+        int vals[4] = { GetRValue(c), GetGValue(c), GetBValue(c), CpAlpha() };
+        static const wchar_t* kNames[4] = { L"R", L"G", L"B", L"A" };
+        for (int i = 0; i < 4; i++) {
+            const RECT& t = L.track[i];
+            label(kNames[i], CP_M, t.top - 4, 20, &ink);
+            int r = vals[0], gg = vals[1], b = vals[2];
+            Color c0, c1;
+            if (i == 0)      { c0 = Color(255, 0, gg, b); c1 = Color(255, 255, gg, b); }
+            else if (i == 1) { c0 = Color(255, r, 0, b);  c1 = Color(255, r, 255, b); }
+            else if (i == 2) { c0 = Color(255, r, gg, 0); c1 = Color(255, r, gg, 255); }
+            else             { c0 = Color(0, r, gg, b);   c1 = Color(255, r, gg, b); }
+            int tw = t.right - t.left, th = t.bottom - t.top;
+            g.SetSmoothingMode(SmoothingModeNone);
+            if (i == 3) {   // a checkerboard shows through the alpha track
+                SolidBrush lt(Color(255, 255, 255, 255)), dk(Color(255, 200, 200, 200));
+                g.FillRectangle(&lt, (INT)t.left, (INT)t.top, tw, th);
+                for (int cx = 0; cx < tw; cx += 6)
+                    for (int cy = 0; cy < th; cy += 6)
+                        if (((cx / 6) + (cy / 6)) & 1) g.FillRectangle(&dk, (INT)t.left + cx, (INT)t.top + cy, min(6, tw - cx), min(6, th - cy));
+            }
+            LinearGradientBrush grad(Point((INT)t.left - 1, 0), Point((INT)t.right + 1, 0), c0, c1);
+            g.FillRectangle(&grad, (INT)t.left, (INT)t.top, tw, th);
+            frame(t);
+            float tx = t.left + vals[i] * tw / (float)(i == 3 ? 100 : 255);
+            SolidBrush thumbIn(Color(255, 255, 255, 255));
+            Pen thumbOut(Color(255, 0, 0, 0), 1.f);
+            g.FillRectangle(&thumbIn, tx - 3, (REAL)t.top - 4, 6.f, (REAL)th + 8);
+            g.DrawRectangle(&thumbOut, tx - 3, (REAL)t.top - 4, 6.f, (REAL)th + 8);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.FillRectangle(&box, rectF(L.num[i]));
+            frame(L.num[i]);
+        }
+
+        // Hex and CSS, each with a copy button
+        label(L"Hex", CP_M, L.hexBox.top, 22, &ink);
+        label(L"CSS", CP_M, L.cssBox.top, 22, &ink);
+        g.FillRectangle(&box, rectF(L.hexBox)); frame(L.hexBox);
+        g.FillRectangle(&box, rectF(L.cssBox)); frame(L.cssBox);
+        HBITMAP copyIcon = MakeBitmapFromSvg(kEditCopyD, 16, inkC, 24.0f, bgC);
+        if (copyIcon) {
+            Bitmap icon(copyIcon, NULL);
+            for (const RECT* r : { &L.hexCopy, &L.cssCopy })
+                g.DrawImage(&icon, (INT)(r->left + r->right) / 2 - 8, (INT)(r->top + r->bottom) / 2 - 8, 16, 16);
+            DeleteObject(copyIcon);
+        }
+
+        // Recent colours and the palette
+        auto swatches = [&](const wchar_t* title, int y, const COLORREF* cols, int count) {
+            label(title, CP_M, y, 18, &dim);
+            g.SetSmoothingMode(SmoothingModeNone);
+            for (int i = 0; i < count; i++) {
+                int sx = CP_M + (i % 8) * (L.swatch + 4), sy = y + 20 + (i / 8) * (L.swatch + 4);
+                SolidBrush b(Color(255, GetRValue(cols[i]), GetGValue(cols[i]), GetBValue(cols[i])));
+                g.FillRectangle(&b, sx, sy, L.swatch, L.swatch);
+                g.DrawRectangle(&line, sx, sy, L.swatch - 1, L.swatch - 1);
+            }
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+        };
+        if (g_recentColorCount) swatches(L"Recent", L.recentY, g_recentColors, g_recentColorCount);
+        else { label(L"Recent", CP_M, L.recentY, 18, &dim); label(L"(none yet)", CP_M + 50, L.recentY, 18, &dim); }
+        swatches(L"Palette", L.paletteY, g_customColors, 16);
+        return;
+    }
+
+    // Stroke style
+    label(L"Width:", CP_M, L.widthY, 22, &ink);
+    g.FillRectangle(&box, rectF(L.width)); frame(L.width);
+    label(L"px", L.width.right + 6, L.widthY, 22, &dim);
+
+    label(L"Join:", CP_M, L.joinY, 26, &ink);
+    for (int i = 0; i < 3; i++) {
+        static const int kJoins[3] = { JOIN_BEVEL, JOIN_ROUND, JOIN_MITER };   // Inkscape's order
+        button(L.join[i], g_lineJoin == kJoins[i]);
+        CpDrawStyleIcon(g, L.join[i], true, kJoins[i], inkC);
+    }
+    label(L"Miter limit:", CP_M, L.miterY, 22, &ink);
+    g.FillRectangle(&box, rectF(L.miter)); frame(L.miter);
+
+    label(L"Cap:", CP_M, L.capY, 26, &ink);
+    for (int i = 0; i < 3; i++) {
+        button(L.cap[i], g_lineCap == i);
+        CpDrawStyleIcon(g, L.cap[i], false, i, inkC);
+    }
+    g.DrawString(L"Join and cap apply to the shape and line tools.", -1, &fText,
+                 RectF((REAL)CP_M, (REAL)L.capY + 40, (REAL)(W - 2 * CP_M), 60.f), NULL, &dim);
+}
+
+static LRESULT CALLBACK ColorPanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        g_cpFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        g_cpBold = CreateFontW(-12, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        for (int i = 0; i < CPE_COUNT; i++) {
+            DWORD style = WS_CHILD | ES_AUTOHSCROLL | (i <= CPE_A ? ES_NUMBER : 0);
+            g_cpEdit[i] = CreateWindowExW(0, L"EDIT", L"", style, 0, 0, 10, 10, hwnd,
+                                          (HMENU)(INT_PTR)(100 + i), GetModuleHandle(NULL), NULL);
+            SendMessage(g_cpEdit[i], WM_SETFONT, (WPARAM)g_cpFont, FALSE);
+            SetWindowSubclass(g_cpEdit[i], CpEditProc, i, 0);
+        }
+        g_cpTip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL, WS_POPUP | TTS_ALWAYSTIP,
+                                 0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
+        struct { UINT id; const wchar_t* text; } tips[] = {
+            { 1, L"No paint" }, { 2, L"Flat color" },
+            { 3, L"Copy the hex code" }, { 4, L"Copy the CSS colour" },
+            { 10, L"Bevel join" }, { 11, L"Round join" }, { 12, L"Miter join" },
+            { 20, L"Butt cap" }, { 21, L"Round cap" }, { 22, L"Square cap" },
+        };
+        for (auto& t : tips) {
+            TOOLINFOW ti = { sizeof(ti) };
+            ti.uFlags = TTF_SUBCLASS; ti.hwnd = hwnd; ti.uId = t.id;
+            ti.lpszText = const_cast<LPWSTR>(t.text);
+            SendMessage(g_cpTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_SIZE:
+        CpPlace();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_SHOWWINDOW:
+        if (wParam) { CpSync(); }
+        break;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        Bitmap back(max(1, (int)rc.right), max(1, (int)rc.bottom), PixelFormat32bppPARGB);
+        {
+            Graphics g(&back);
+            CpPaint(hwnd, g, rc.right, rc.bottom);
+        }
+        Graphics screen(hdc);
+        screen.DrawImage(&back, 0, 0, rc.right, rc.bottom);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        SetFocus(hwnd);   // finishes any typing box
+        if (pt.x < LP_EDGE_W) {   // the left edge resizes, as on the Layers panel
+            RECT rc; GetClientRect(hwnd, &rc);
+            POINT sp = pt; ClientToScreen(hwnd, &sp);
+            g_cpResizing = true;
+            g_cpResizeX0 = sp.x;
+            g_cpResizeW0 = rc.right;
+            SetCapture(hwnd);
+            return 0;
+        }
+        CpLayout L = CpGetLayout(hwnd);
+        for (int i = 0; i < 3; i++) if (PtInRect(&L.tab[i], pt)) { CpSetTab(i); return 0; }
+        if (g_cpTab == CPT_STYLE) {
+            static const int kJoins[3] = { JOIN_BEVEL, JOIN_ROUND, JOIN_MITER };
+            for (int i = 0; i < 3; i++) {
+                if (PtInRect(&L.join[i], pt)) { g_lineJoin = kJoins[i]; CpChanged(); return 0; }
+                if (PtInRect(&L.cap[i], pt))  { g_lineCap = i;          CpChanged(); return 0; }
+            }
+            return 0;
+        }
+        if (PtInRect(&L.mode[0], pt)) { CpSetNone(true);  return 0; }
+        if (PtInRect(&L.mode[1], pt)) { CpSetNone(false); return 0; }
+        if (CpNone()) return 0;
+        for (int i = 0; i < 4; i++) {
+            RECT t = L.track[i];
+            InflateRect(&t, 4, 6);
+            if (PtInRect(&t, pt)) {
+                g_cpDrag = i;
+                SetCapture(hwnd);
+                CpDragTo(L, i, pt.x);
+                return 0;
+            }
+        }
+        if (PtInRect(&L.hexCopy, pt)) { CopyTextToClipboard(CpHexText(CpColor(), CpAlpha())); return 0; }
+        if (PtInRect(&L.cssCopy, pt)) { CopyTextToClipboard(CpCssText(CpColor(), CpAlpha())); return 0; }
+        // A recent or palette swatch: its colour, keeping the opacity
+        auto hitSwatch = [&](int y, int count) -> int {
+            for (int i = 0; i < count; i++) {
+                int sx = CP_M + (i % 8) * (L.swatch + 4), sy = y + 20 + (i / 8) * (L.swatch + 4);
+                RECT r = { sx, sy, sx + L.swatch, sy + L.swatch };
+                if (PtInRect(&r, pt)) return i;
+            }
+            return -1;
+        };
+        int i = hitSwatch(L.recentY, g_recentColorCount);
+        if (i >= 0) { CpSetColor(g_recentColors[i], CpAlpha()); return 0; }
+        i = hitSwatch(L.paletteY, 16);
+        if (i >= 0) { CpSetColor(g_customColors[i], CpAlpha()); return 0; }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (g_cpResizing) {
+            // The panel moves as it resizes, so work in screen coordinates
+            POINT sp = pt; ClientToScreen(hwnd, &sp);
+            int w = LpClampWidth(g_cpResizeW0 + (g_cpResizeX0 - sp.x));
+            if (w != g_layersPanelW) {
+                g_layersPanelW = w;
+                LayoutCanvasAndFolderBrowser(g_hwndMain);
+                UpdateWindow(g_hwndMain);
+            }
+        } else if (g_cpDrag >= 0) CpDragTo(CpGetLayout(hwnd), g_cpDrag, pt.x);
+        return 0;
+    }
+
+    case WM_SETCURSOR: {
+        POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+        if (LOWORD(lParam) == HTCLIENT && (g_cpResizing || pt.x < LP_EDGE_W)) {
+            SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if (g_cpResizing) {
+            g_cpResizing = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            if (g_zoomFitMode) ZoomToFit(); else CenterScrollOnCanvas();
+            InvalidateCanvas();
+        }
+        if (g_cpDrag >= 0) {
+            g_cpDrag = -1;
+            if (GetCapture() == hwnd) ReleaseCapture();
+        }
+        return 0;
+
+    case WM_COMMAND: {
+        int i = LOWORD(wParam) - 100;
+        if (i < 0 || i >= CPE_COUNT || g_cpUpdating) break;
+        if (HIWORD(wParam) == EN_CHANGE) CpEditChanged(i);
+        else if (HIWORD(wParam) == EN_KILLFOCUS) CpCommitEdit(i);
+        return 0;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        static HBRUSH s_dark = CreateSolidBrush(RGB(45, 45, 45));
+        HDC dc = (HDC)wParam;
+        if (g_darkMode) {
+            SetTextColor(dc, RGB(220, 220, 220));
+            SetBkColor(dc, RGB(45, 45, 45));
+            return (LRESULT)s_dark;
+        }
+        SetTextColor(dc, RGB(0, 0, 0));
+        SetBkColor(dc, RGB(255, 255, 255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
 
 static LRESULT CALLBACK SideTabsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -16948,7 +17749,7 @@ static LRESULT CALLBACK SideTabsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     case WM_CREATE: {
         HWND tip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL, WS_POPUP | TTS_ALWAYSTIP,
             0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        static const wchar_t* kTips[STAB_COUNT] = { L"Layers (F7)" };
+        static const wchar_t* kTips[STAB_COUNT] = { L"Layers (F7)", L"Fill and Stroke" };
         for (int t = 0; t < STAB_COUNT; t++) {
             TOOLINFOW ti = { sizeof(ti) };
             ti.uFlags = TTF_SUBCLASS;
@@ -16993,7 +17794,9 @@ static LRESULT CALLBACK SideTabsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     g.FillRectangle(&acc, (INT)r.right - 3, (INT)r.top, 3, ST_TAB_H);
                 }
                 GraphicsPath path(FillModeWinding);
-                AddSvgPath(path, kLayersMenuD, 20.f / 24.f);
+                if (t == STAB_COLOR) AddSvgPath(path, kColorEditD, 18.f / 20.f);   // the palette, as on the colour button
+                else                 AddSvgPath(path, kLayersMenuD, 20.f / 24.f);
+                if (t == STAB_COLOR) { Matrix c; c.Translate(1.f, 1.f); path.Transform(&c); }
                 Matrix m; m.Translate((SIDE_TABS_W - 20) / 2.f - (open ? 1.f : 0.f), r.top + (ST_TAB_H - 20) / 2.f);
                 path.Transform(&m);
                 SolidBrush ink(g_darkMode ? Color(255, 220, 220, 220) : Color(255, 45, 45, 45));
@@ -17010,7 +17813,9 @@ static LRESULT CALLBACK SideTabsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         for (int t = 0; t < STAB_COUNT; t++) {
             RECT r = StTabRect(t);
-            if (PtInRect(&r, pt) && t == STAB_LAYERS) ToggleLayersPanel();
+            if (!PtInRect(&r, pt)) continue;
+            if (t == STAB_LAYERS) ToggleLayersPanel();
+            else if (t == STAB_COLOR) ToggleColorPanel();
         }
         return 0;
     }
@@ -17617,7 +18422,9 @@ static void LayoutCanvasAndFolderBrowser(HWND hwndMain)
     int barH    = (g_animActive && g_hwndAnimBar) ? ANIM_BAR_H : 0;
     int canvasH = max(0, H - canvasY - statusH - stripH - barH);
     int tabsW   = g_hwndSideTabs ? SIDE_TABS_W : 0;
-    int panelW  = (g_showLayersPanel && g_hwndLayersPanel) ? min(g_layersPanelW, max(170, W / 2)) : 0;
+    HWND panel  = (g_showLayersPanel && g_hwndLayersPanel) ? g_hwndLayersPanel
+                : (g_showColorPanel  && g_hwndColorPanel)  ? g_hwndColorPanel : NULL;
+    int panelW  = panel ? min(g_layersPanelW, max(170, W / 2)) : 0;
 
     // The search panel, when open, takes the left end of the strip's row
     int searchW = (showStrip && g_folderSearchOpen && g_hwndFolderSearch) ? min(FOLDER_SEARCH_W, W / 2) : 0;
@@ -17628,7 +18435,7 @@ static void LayoutCanvasAndFolderBrowser(HWND hwndMain)
         dwp = DeferWindowPos(dwp, g_hwndSideTabs, NULL, W - tabsW, canvasY, tabsW, canvasH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && panelW)
-        dwp = DeferWindowPos(dwp, g_hwndLayersPanel, NULL, W - tabsW - panelW, canvasY, panelW, canvasH,
+        dwp = DeferWindowPos(dwp, panel, NULL, W - tabsW - panelW, canvasY, panelW, canvasH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
     if (dwp && barH)
         dwp = DeferWindowPos(dwp, g_hwndAnimBar, NULL, 0, H - statusH - stripH - barH, W, barH,
@@ -17853,6 +18660,19 @@ static void DrawAlphaSwatch(HDC hdc, const RECT& rc, COLORREF color, BYTE alpha)
 // ============================================================
 static void PaintColorStrip(HDC hdc, int stripX, int stripY, int stripW)
 {
+    // The Colour tab and panel show these colours too: repaint them when they change
+    {
+        static COLORREF s_fg = (COLORREF)-1, s_bg = (COLORREF)-1;
+        static int s_fgA = -1, s_bgA = -1, s_active = -1, s_none = -1;
+        static float s_width = -1;
+        int none = (g_strokeNone ? 1 : 0) | (g_fillNone ? 2 : 0);
+        if (s_fg != g_fgColor || s_bg != g_bgColor || s_fgA != g_fgAlpha || s_bgA != g_bgAlpha ||
+            s_active != (int)g_strokeActive || s_none != none || s_width != g_brushSize) {
+            s_fg = g_fgColor; s_bg = g_bgColor; s_fgA = g_fgAlpha; s_bgA = g_bgAlpha; s_active = g_strokeActive;
+            s_none = none; s_width = g_brushSize;
+            CpSync();
+        }
+    }
     RECT rc = {stripX, stripY, stripX + stripW, stripY + COLORSTRIP_H};
     if (g_darkMode) {
         HBRUSH hb = CreateSolidBrush(RGB(45,45,48)); FillRect(hdc, &rc, hb); DeleteObject(hb);
@@ -17867,9 +18687,21 @@ static void PaintColorStrip(HDC hdc, int stripX, int stripY, int stripW)
                  stripX + CS_FG_X + CS_BG_OX + CS_FG_W, sy + 4 + CS_FG_H};
     DrawAlphaSwatch(hdc, bgRc, g_bgColor, BgAlphaByte());
 
+    // "No paint" (Fill and Stroke panel): a red line across the swatch, as in Inkscape
+    auto noPaintMark = [&](const RECT& r) {
+        HPEN red = CreatePen(PS_SOLID, 2, RGB(220, 30, 30));
+        HPEN old = (HPEN)SelectObject(hdc, red);
+        MoveToEx(hdc, r.left + 1, r.bottom - 2, NULL);
+        LineTo(hdc, r.right - 2, r.top + 1);
+        SelectObject(hdc, old);
+        DeleteObject(red);
+    };
+    if (g_fillNone) noPaintMark(bgRc);
+
     // Stroke swatch
     RECT fgRc = {stripX + CS_FG_X, sy, stripX + CS_FG_X + CS_FG_W, sy + CS_FG_H};
     DrawAlphaSwatch(hdc, fgRc, g_fgColor, FgAlphaByte());
+    if (g_strokeNone) noPaintMark(fgRc);
 
     // Active selection indicator: white+black outer ring on the active swatch
     {
@@ -19177,6 +20009,13 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // shown from its side tab or the View menu (WM_APP restores it at startup)
 
             wcs.style         = 0;
+            wcs.lpfnWndProc   = ColorPanelWndProc;
+            wcs.lpszClassName = L"MyPaintColorPanel";
+            RegisterClassEx(&wcs);
+            g_hwndColorPanel = CreateWindowEx(0, L"MyPaintColorPanel", NULL,
+                WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,   // its typing boxes don't flicker
+                0, 0, LAYERS_PANEL_W, 100, hwnd, nullptr, GetModuleHandle(NULL), NULL);
+            // shown from its side tab
             wcs.lpfnWndProc   = SideTabsWndProc;
             wcs.lpszClassName = L"MyPaintSideTabs";
             RegisterClassEx(&wcs);
@@ -19468,7 +20307,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ti.hwnd     = hwnd;
             if (g_hwndColorEdit) {
                 ti.uId      = (UINT_PTR)g_hwndColorEdit;
-                ti.lpszText = (LPWSTR)L"Edit Colors";
+                ti.lpszText = (LPWSTR)L"Fill and Stroke";
                 SendMessage(g_hwndColorTip, TTM_ADDTOOL, 0, (LPARAM)&ti);
             }
             if (g_hwndReset) {
@@ -19626,6 +20465,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // Deferred from WM_CREATE — runs after ShowWindow/SetWindowPos settle the final layout
         CenterScrollOnCanvas();
         if (g_showLayersPanel && g_hwndLayersPanel) { LayersPanelSync(); ShowWindow(g_hwndLayersPanel, SW_SHOW); }
+        if (g_showColorPanel && g_hwndColorPanel) ShowWindow(g_hwndColorPanel, SW_SHOW);
         // Open the folder browser if it was open the last time MyPaint was started
         // the same way (with or without an image; it takes focus). This runs after
         // the command-line image is loaded, so it lists that folder
@@ -19695,9 +20535,25 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             HMENU m = CreatePopupMenu();
             AppendMenu(m, MF_STRING, 1, rgbItem);
             AppendMenu(m, MF_STRING, 2, hexItem);
+
+            // The Copy icon beside both, as in the folder strip's menu
+            COLORREF crBg   = g_darkMode ? RGB(43, 43, 43)    : GetSysColor(COLOR_MENU);
+            COLORREF crText = g_darkMode ? RGB(220, 220, 220) : GetSysColor(COLOR_MENUTEXT);
+            HBITMAP copyIcon = MakeBitmapFromSvg(kEditCopyD, 16,
+                Color(255, GetRValue(crText), GetGValue(crText), GetBValue(crText)), 24.0f,
+                Color(255, GetRValue(crBg), GetGValue(crBg), GetBValue(crBg)));
+            if (copyIcon) {
+                MENUITEMINFOW mii = { sizeof(mii) };
+                mii.fMask    = MIIM_BITMAP;
+                mii.hbmpItem = copyIcon;
+                SetMenuItemInfoW(m, 1, FALSE, &mii);
+                SetMenuItemInfoW(m, 2, FALSE, &mii);
+            }
+
             POINT sp = { x, y }; ClientToScreen(hwnd, &sp);
             int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, hwnd, NULL);
             DestroyMenu(m);
+            if (copyIcon) DeleteObject(copyIcon);
             if (cmd == 1) CopyTextToClipboard(rgb);
             else if (cmd == 2) CopyTextToClipboard(hex);
             return 0;
@@ -19938,7 +20794,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_TOOL_DROPPER:   SetTool(TOOL_DROPPER);   break;
 
         // ── Colour swatches ─────────────────────────────────────
-        case ID_COLOR_EDIT:   ChooseActiveColor(); break;
+        case ID_COLOR_EDIT:   ToggleColorPanel(); break;   // the Fill and Stroke panel
         case ID_COLOR_RESET:  ResetCustomColors(); break;
 
         // ── Brush size ──────────────────────────────────────────

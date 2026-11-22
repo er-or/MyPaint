@@ -62,6 +62,15 @@ the Win32 API and GDI+. No frameworks, one source file, one small executable.
   F5 starts a slideshow (3, 5 or 10 seconds per image). The arrow keys and
   scroll wheel step through the folder, Space pauses, Esc returns; moving the
   mouse shows a control bar. A folder browser search limits both to its matches.
+- **Fill and Stroke panel:** the palette button in the colour strip (or the
+  side tab under Layers) opens a panel modelled on Inkscape's Fill and
+  Stroke dialog. **Fill** is the background colour, which fills shapes;
+  **Stroke paint** is the foreground colour. Each can be **No paint** (shapes
+  without a fill or an outline) or a **Flat color**, with R, G, B and alpha
+  sliders (alpha 0–100), hex and CSS boxes with copy buttons, recent colours
+  and the palette. **Stroke style** sets the line width and the join (bevel,
+  round, miter, with a miter limit) and cap (butt, round, square) of shape
+  outlines and lines.
 - **Copy a colour:** right-click the foreground or background swatch at the
   left of the colour strip to copy it as `rgb(r,g,b)` or `#RRGGBB`. Pick a
   colour from the image with the colour picker first to copy that one.
